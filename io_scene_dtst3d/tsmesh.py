@@ -24,7 +24,7 @@ class TSDrawPrimitive:
         self.type = material_and_flags & TSDrawPrimitiveType.TypeMask
         self.material_index = material_and_flags & TSDrawPrimitiveType.MaterialMask
 
-        
+
 class TSNullMesh:
     pass
 
@@ -40,27 +40,27 @@ class TSMesh:
     @property
     def vertices(self):
         return self._vertices
-    
+
     @property
     def tvertices(self):
         return self._tvertices
-    
+
     @property
     def t2vertices(self):
         return self._t2vertices
-    
+
     @property
     def colors(self):
         return self._colors
-    
+
     @property
     def primitives(self) -> List[TSDrawPrimitive]:
         return self._primitives
-    
+
     @property
     def indices(self):
         return self._indices
-    
+
     def copy_data_from(self, other):
         """Copies mesh data from a parent mesh"""
         self._vertices = other._vertices.copy()
@@ -145,7 +145,7 @@ class TSMesh:
         starts = []
         elements = []
         material_indices = []
-        
+
         if version > 25:
             # mesh primitives (start, numElements) and indices are stored as 32 bit values
             sz_prim_in = ts_alloc.read32()
@@ -178,7 +178,7 @@ class TSMesh:
 
             prim = TSDrawPrimitive(start, num_elements, material_index)
             self._primitives.append(prim)
-            
+
         # merge indices (deprecated)
         num_merge_indices = ts_alloc.read32()
         for _ in range(num_merge_indices):

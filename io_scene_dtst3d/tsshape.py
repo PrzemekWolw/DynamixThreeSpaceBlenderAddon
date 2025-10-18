@@ -33,13 +33,13 @@ class TQuaternion16:
     z: int
     w: int
 
-    MAX_VALUE = 0x7fff 
+    MAX_VALUE = 0x7fff
 
     def __init__(self, x, y, z, w):
         self.x = x
         self.y = y
         self.z = z
-        self.w = w   
+        self.w = w
 
     def to_quat_f(self):
         return TQuaternionF(self.x / TQuaternion16.MAX_VALUE,
@@ -136,23 +136,23 @@ class TSShape:
     @property
     def details(self) -> List[ShapeDetail]:
         return self._details
-    
+
     @property
     def materials(self) -> List[TSMaterial]:
         return self._materials
-    
+
     @property
     def meshes(self) -> List[TSMesh]:
         return self._meshes
-    
+
     @property
     def nodes(self) -> List[ShapeNode]:
         return self._nodes
-    
+
     @property
     def objects(self) -> List[ShapeObject]:
         return self._objects
-    
+
     @property
     def names(self) -> List[str]:
         return self._names
@@ -164,7 +164,7 @@ class TSShape:
             if (node_index >= start) and (node_index < end):
                 return x
         return -1
-    
+
     def get_sub_shape_for_object(self, object_index) -> int:
         for x in range(len(self._sub_shape_first_object)):
             start = self._sub_shape_first_object[x]
@@ -172,23 +172,27 @@ class TSShape:
             if (object_index >= start) and (object_index < end):
                 return x
         return -1
-    
+
     def get_sub_shape_details(self, sub_shape_index) -> List[ShapeDetail]:
         sub_shape_details = []
         for detail in self._details:
             if detail.sub_shape_num == sub_shape_index or detail.sub_shape_num < 0:
                 sub_shape_details.append(detail)
         return sub_shape_details
-    
+
     def read(self, stream: BinaryIO):
         reader = stream
-
-        version = struct.unpack('<i', reader.read(4))[0] & 0xFF
+        version_full = struct.unpack('<i', reader.read(4))[0]
+        version = version_full & 0xFF
         if version < 19:
             raise Exception("This DTS file is too old")
-        if version >= 27:
-            raise Exception("This DTS file is too new, please file an issue report with the problem file attached.")
-
+        # v29+ files have a quick object-name header before the mem buffers
+        if version >= 29 and version < 31:
+            num_objects_header = struct.unpack('<i', reader.read(4))[0]
+            for _ in range(num_objects_header):
+                name_len = struct.unpack('<I', reader.read(4))[0]
+                _ = reader.read(name_len)
+        # mem buffers
         size_mem_buffer = struct.unpack('<i', reader.read(4))[0]
         start_u16 = struct.unpack('<i', reader.read(4))[0]
         start_u8 = struct.unpack('<i', reader.read(4))[0]
@@ -206,16 +210,15 @@ class TSShape:
         # materials
         mat_list_version = struct.unpack('<B', reader.read(1))[0]
         mat_count = struct.unpack('<i', reader.read(4))[0]
-        
+
         for x in range(mat_count):
             mat_name_length = struct.unpack('<B', reader.read(1))[0]
             mat_name_bytes = reader.read(mat_name_length)
             mat_name = mat_name_bytes.decode('utf-8')
-            
-            self._materials.append(TSMaterial(mat_name))
-            
-        # see Torque3D material list parsing if properties are desired
 
+            self._materials.append(TSMaterial(mat_name))
+
+        # see Torque3D material list parsing if properties are desired
     def read_from_path(self, path: str):
         with open(path, "rb") as f:
             self.read(f)
@@ -265,7 +268,7 @@ class TSShape:
             node = ShapeNode()
             node.assemble(ts_alloc)
             self._nodes.append(node)
-            
+
         ts_alloc.check_guard()
 
         # Object data
@@ -310,13 +313,14 @@ class TSShape:
             self._sub_shape_num_objects.append(ts_alloc.read32())
         for _ in range(num_sub_shapes):
             ts_alloc.read32()  # deprecated subShapeNumDecals
+
         ts_alloc.check_guard()
 
         # Default rotations and translations
         for x in range(num_nodes):
             quat = TQuaternion16(ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16())
             self._nodes[x].rotation = quat
-                
+
         ts_alloc.align32()
 
         for x in range(num_nodes):
@@ -382,11 +386,7 @@ class TSShape:
             self._details.append(detail)
 
         ts_alloc.check_guard()
-
-        if version >= 27:
-            raise NotImplementedError("Vertex format")
-
-        # Meshes
+        # Meshes (support >=27 here; TSMesh.assemble handles it)
         for _ in range(num_meshes):
             mesh_type_raw = ts_alloc.read32()
 
@@ -420,5 +420,3 @@ class TSShape:
 
         if version < 23:
             raise NotImplementedError("Skin information")
-
-            
