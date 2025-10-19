@@ -153,6 +153,7 @@ def apply_node_transform_to_object(shape_node, ob, is_cdae=False):
     ob.location = translate_vert(shape_node.translation)
 
     rotation_quaternion = shape_node.rotation.to_quat_f()
+    # Flip only for legacy DTS (not for CDAE v31)
     if not is_cdae:
         rotation_quaternion.x = rotation_quaternion.x * -1.0
     ob.rotation_mode = 'QUATERNION'
@@ -220,68 +221,122 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
     apply_node_transform_to_object(shape_node, ob, is_cdae=is_cdae)
     scn.collection.objects.link(ob)
 
+    # Helper: ensure a material slot exists for this primitive and return its slot index
+    def ensure_material_slot(prim):
+        key = prim.material_index
+        if key in material_remap:
+            return material_remap[key]
+        # Pick a name: existing material name if valid, otherwise a fallback
+        if 0 <= key < len(shape.materials):
+            mname = shape.materials[key].name
+        else:
+            # Covers NoMaterial or exporter giving an invalid index
+            mname = f"Mat_{key}"
+        slot = len(material_remap)
+        material_remap[key] = slot
+        ob.data.materials.append(create_material(mname))
+        return slot
+
     mesh_indices = shape_mesh.indices
-    vertices = [bm.verts.new(translate_vert(v)) for v in shape_mesh.vertices]
+    verts = shape_mesh.vertices
+    norms = getattr(shape_mesh, "normals", [])
 
-    def add_face(a, b, c, mat_index):
-        try:
-            face = bm.faces.new((vertices[a], vertices[b], vertices[c]))
-            if uv_layer is not None:
-                face.loops[0][uv_layer].uv = translate_uv(shape_mesh.tvertices[a])
-                face.loops[1][uv_layer].uv = translate_uv(shape_mesh.tvertices[b])
-                face.loops[2][uv_layer].uv = translate_uv(shape_mesh.tvertices[c])
-            if uv2_layer is not None:
-                face.loops[0][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[a])
-                face.loops[1][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[b])
-                face.loops[2][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[c])
-            if vc_layer is not None:
-                face.loops[0][vc_layer] = shape_mesh.colors[a]
-                face.loops[1][vc_layer] = shape_mesh.colors[b]
-                face.loops[2][vc_layer] = shape_mesh.colors[c]
-            face.material_index = material_remap[mat_index]
-            face.smooth = True
-        except Exception as e:
-            print("Face add error:", e)
+    # Merge-by-(position,normal) when normals are available and match vertex count
+    use_merge = norms and (len(norms) == len(verts))
+    if use_merge:
+        vert_remap = {}
+        remapped_verts = []
+        def get_merged_index(vidx: int) -> int:
+            key = (verts[vidx], norms[vidx])
+            idx = vert_remap.get(key)
+            if idx is None:
+                idx = len(remapped_verts)
+                vert_remap[key] = idx
+                remapped_verts.append(bm.verts.new(translate_vert(verts[vidx])))
+            return idx
+        def add_face_from_indices(i0, i1, i2, mat_slot):
+            try:
+                a = get_merged_index(i0)
+                b = get_merged_index(i1)
+                c = get_merged_index(i2)
+                face = bm.faces.new((remapped_verts[a], remapped_verts[b], remapped_verts[c]))
+                if uv_layer is not None:
+                    face.loops[0][uv_layer].uv = translate_uv(shape_mesh.tvertices[i0])
+                    face.loops[1][uv_layer].uv = translate_uv(shape_mesh.tvertices[i1])
+                    face.loops[2][uv_layer].uv = translate_uv(shape_mesh.tvertices[i2])
+                if uv2_layer is not None:
+                    face.loops[0][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i0])
+                    face.loops[1][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i1])
+                    face.loops[2][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i2])
+                if vc_layer is not None:
+                    face.loops[0][vc_layer] = shape_mesh.colors[i0]
+                    face.loops[1][vc_layer] = shape_mesh.colors[i1]
+                    face.loops[2][vc_layer] = shape_mesh.colors[i2]
+                face.material_index = mat_slot
+                face.smooth = True
+            except Exception as e:
+                print("Face add error:", e)
+    else:
+        # One bm-vertex per original vertex
+        vertices = [bm.verts.new(translate_vert(v)) for v in verts]
+        def add_face_from_indices(i0, i1, i2, mat_slot):
+            try:
+                face = bm.faces.new((vertices[i0], vertices[i1], vertices[i2]))
+                if uv_layer is not None:
+                    face.loops[0][uv_layer].uv = translate_uv(shape_mesh.tvertices[i0])
+                    face.loops[1][uv_layer].uv = translate_uv(shape_mesh.tvertices[i1])
+                    face.loops[2][uv_layer].uv = translate_uv(shape_mesh.tvertices[i2])
+                if uv2_layer is not None:
+                    face.loops[0][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i0])
+                    face.loops[1][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i1])
+                    face.loops[2][uv2_layer].uv = translate_uv(shape_mesh.t2vertices[i2])
+                if vc_layer is not None:
+                    face.loops[0][vc_layer] = shape_mesh.colors[i0]
+                    face.loops[1][vc_layer] = shape_mesh.colors[i1]
+                    face.loops[2][vc_layer] = shape_mesh.colors[i2]
+                face.material_index = mat_slot
+                face.smooth = True
+            except Exception as e:
+                print("Face add error:", e)
 
+    # Build geometry
     for prim in shape_mesh.primitives:
-        if prim.material_index not in material_remap:
-            ts_material = shape.materials[prim.material_index]
-            material_remap[prim.material_index] = len(material_remap)
-            ob.data.materials.append(create_material(ts_material.name))
+        mat_slot = ensure_material_slot(prim)
 
         if prim.type == TSDrawPrimitiveType.Triangles:
             prim_indices = mesh_indices[prim.start:prim.start+prim.num_elements]
             if is_cdae:
                 for x in range(0, len(prim_indices), 3):
-                    a = prim_indices[x + 0]
-                    b = prim_indices[x + 1]
-                    c = prim_indices[x + 2]
-                    add_face(a, b, c, prim.material_index)
+                    i0 = prim_indices[x + 0]
+                    i1 = prim_indices[x + 1]
+                    i2 = prim_indices[x + 2]
+                    add_face_from_indices(i0, i1, i2, mat_slot)
             else:
                 for x in range(0, len(prim_indices), 3):
-                    a = prim_indices[x + 2]
-                    b = prim_indices[x + 1]
-                    c = prim_indices[x + 0]
-                    add_face(a, b, c, prim.material_index)
+                    i0 = prim_indices[x + 2]
+                    i1 = prim_indices[x + 1]
+                    i2 = prim_indices[x + 0]
+                    add_face_from_indices(i0, i1, i2, mat_slot)
 
         elif prim.type == TSDrawPrimitiveType.Strip:
             strip_indices = mesh_indices[prim.start:prim.start+prim.num_elements]
             prim_indices = triangle_strip_to_list(strip_indices, False)
             if is_cdae:
                 for x in range(0, len(prim_indices), 3):
-                    a = prim_indices[x + 0]
-                    b = prim_indices[x + 1]
-                    c = prim_indices[x + 2]
-                    add_face(a, b, c, prim.material_index)
+                    i0 = prim_indices[x + 0]
+                    i1 = prim_indices[x + 1]
+                    i2 = prim_indices[x + 2]
+                    add_face_from_indices(i0, i1, i2, mat_slot)
             else:
                 for x in range(0, len(prim_indices), 3):
-                    a = prim_indices[x + 2]
-                    b = prim_indices[x + 1]
-                    c = prim_indices[x + 0]
-                    add_face(a, b, c, prim.material_index)
+                    i0 = prim_indices[x + 2]
+                    i1 = prim_indices[x + 1]
+                    i2 = prim_indices[x + 0]
+                    add_face_from_indices(i0, i1, i2, mat_slot)
         else:
             print(f"Unsupported prim type {prim.type}, ignoring.")
 
+    # Invert normals only for CDAE v31
     if is_cdae:
         try:
             bmesh.ops.reverse_faces(bm, faces=bm.faces)
@@ -309,6 +364,7 @@ def _create_detail_empties(shape: TSShape):
         scn.collection.objects.link(parent)
     col_prefixes = ("colmesh", "colbox", "colsphere", "colcapsule")
 
+    # Avoid creating a detail-empty if an object of the same name exists
     object_name_set = set()
     for obj in shape.objects:
         if 0 <= obj.name_index < len(shape.names):
@@ -363,7 +419,7 @@ def _create_scene_from_shape(shape: TSShape):
         subshape_index = shape.get_sub_shape_for_object(obj_index)
         subshape_details = shape.get_sub_shape_details(subshape_index) if subshape_index >= 0 else []
 
-        # Map objectDetailNum -> detail; _a{size} if size >= 10
+        # Map objectDetailNum -> detail; use _a{size} only if size >= 10
         detail_by_object_detail = {}
         for det in subshape_details:
             if det.sub_shape_num == subshape_index and det.object_detail_num >= 0:
@@ -382,11 +438,10 @@ def _create_scene_from_shape(shape: TSShape):
             det = detail_by_object_detail.get(j)
             name_suffix = ""
             if det and getattr(det, "size", None) is not None and det.size >= 10:
-                name_suffix = f"{int(round(det.size))}"
+                name_suffix = f"_a{int(round(det.size))}"
             name_override = base_name + name_suffix
 
             if isinstance(mesh, TSMesh) and mesh.vertices:
-                # Import collision object geometry too (as real meshes)
                 created_object = create_mesh_object_from_shape_object(
                     shape, shape_object, j, name_override=name_override
                 )
@@ -397,17 +452,16 @@ def _create_scene_from_shape(shape: TSShape):
                         created_object.parent = parent
                         created_object.matrix_parent_inverse = parent.matrix_world.inverted()
             elif isinstance(mesh, TSNullMesh):
-                # Skip NullMesh slots (no empties for collision objects or others)
+                # Skip NullMesh slots (no empties created)
                 continue
 
         if not created_any:
-            # Fallback: one empty with base name
             created_object = create_dummy_object_from_shape_object(shape, shape_object, name_override=base_name)
             if parent is not None and created_object is not None:
                 created_object.parent = parent
                 created_object.matrix_parent_inverse = parent.matrix_world.inverted()
 
-    # Detail-level empties for bb/nulldetail (skip collisions and duplicates)
+    # Detail-level empties (bb/nulldetail) — skip collisions and duplicates
     _create_detail_empties(shape)
 
 # ======================================================
@@ -590,7 +644,10 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         c_sz, _, c_blob = _read_packed_vector(u)
         colors = _decode_color_bytes_to_rgba_floats(c_blob) if c_sz else []
 
-        _ = _read_packed_vector(u); _ = _read_packed_vector(u)
+        # Read normals so we can merge by (position,normal)
+        n_sz, n_es, n_blob = _read_packed_vector(u)  # normals (float3)
+        norms = _unpack_array(n_blob, "fff") if n_sz else []
+        _ = _read_packed_vector(u)  # encoded normals (skip)
 
         p_sz, _, p_blob = _read_packed_vector(u)
         prims_raw = _unpack_array(p_blob, "iii")
@@ -614,26 +671,24 @@ def _read_cdae_shape(filepath: str) -> TSShape:
             if ptype == TSDrawPrimitiveType.Triangles:
                 out_start = len(tri_indices)
                 tri_indices.extend(indices[start:start+num])
-                prim = TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles))
-                tri_prims.append(prim)
+                tri_prims.append(TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles)))
             elif ptype == TSDrawPrimitiveType.Strip:
                 out_start = len(tri_indices)
                 tri_indices.extend(_triangulate_strip(indices, start, num))
-                prim = TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles))
-                tri_prims.append(prim)
+                tri_prims.append(TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles)))
             else:
                 out_start = len(tri_indices)
                 tri_indices.extend(indices[start:start+num])
-                prim = TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles))
-                tri_prims.append(prim)
+                tri_prims.append(TSDrawPrimitive(out_start, len(tri_indices)-out_start, (mindex | TSDrawPrimitiveType.Triangles)))
 
         tm = TSMesh()
         tm._vertices  = [tuple(v) for v in verts]
         tm._tvertices = [tuple(t) for t in tverts]
         tm._t2vertices= [tuple(t) for t in t2verts]
         tm._colors    = colors
-        tm._indices   = tri_indices  # already flat list of ints
+        tm._indices   = tri_indices  # flat list of ints
         tm._primitives= tri_prims
+        tm._normals   = [tuple(n) for n in norms] if norms else []
         meshes.append(tm)
 
     num_seqs = int(u.next())

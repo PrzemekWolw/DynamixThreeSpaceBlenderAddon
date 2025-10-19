@@ -30,27 +30,33 @@ class TSNullMesh:
 
 class TSMesh:
     def __init__(self):
-            self._vertices = []
-            self._tvertices = []
-            self._t2vertices = []
-            self._colors = []
+            self._vertices: List[tuple[float, float, float]] = []
+            self._tvertices: List[tuple[float, float]] = []
+            self._t2vertices: List[tuple[float, float]] = []
+            self._colors: List[tuple[float, float, float, float]] = []
+            self._normals: List[tuple[float, float, float]] = []
             self._primitives: List[TSDrawPrimitive] = []
-            self._indices = []
+            self._indices: List[int] = []
+            self._parent_mesh: int = -1
 
     @property
-    def vertices(self):
+    def vertices(self) -> List[tuple[float, float, float]]:
         return self._vertices
 
     @property
-    def tvertices(self):
+    def normals(self) -> List[tuple[float, float, float]]:
+        return self._normals
+
+    @property
+    def tvertices(self) -> List[tuple[float, float]]:
         return self._tvertices
 
     @property
-    def t2vertices(self):
+    def t2vertices(self) -> List[tuple[float, float]]:
         return self._t2vertices
 
     @property
-    def colors(self):
+    def colors(self) -> List[tuple[float, float, float, float]]:
         return self._colors
 
     @property
@@ -58,15 +64,14 @@ class TSMesh:
         return self._primitives
 
     @property
-    def indices(self):
+    def indices(self) -> List[int]:
         return self._indices
 
-    def copy_data_from(self, other):
-        """Copies mesh data from a parent mesh"""
+    def copy_vertex_data_from(self, other):
+        """Copies mesh vertex data from a parent mesh"""
         self._vertices = other._vertices.copy()
         self._tvertices = other._tvertices.copy()
         self._t2vertices = other._t2vertices.copy()
-        self._primitives = other._primitives.copy()
         self._colors = other._colors.copy()
 
     def assemble(self, ts_alloc, version):
@@ -75,6 +80,8 @@ class TSMesh:
         num_frames = ts_alloc.read32()
         num_mat_names = ts_alloc.read32()
         parent_mesh = ts_alloc.read32()
+
+        self._parent_mesh = parent_mesh
 
         bounds = [ts_alloc.read_float() for _ in range(6)]
         center = [ts_alloc.read_float() for _ in range(3)]
@@ -93,31 +100,31 @@ class TSMesh:
         num_verts = ts_alloc.read32()
 
         if parent_mesh < 0:
-            # independent mesh: read vertices
-            for _ in range(num_verts):
-                vertex = (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
+            verts_buffer = ts_alloc.read_float_list(num_verts*3)
+            for x in range(0, num_verts*3, 3):
+                vertex = (verts_buffer[x], verts_buffer[x+1], verts_buffer[x+2])
                 self._vertices.append(vertex)
 
         num_tverts = ts_alloc.read32()
         if parent_mesh < 0:
-            # read texture coords
-            for _ in range(num_tverts):
-                tvertex = (ts_alloc.read_float(), ts_alloc.read_float())
+            tverts_buffer = ts_alloc.read_float_list(num_tverts*2)
+            for x in range(0, num_tverts*2, 2):
+                tvertex = (tverts_buffer[x], tverts_buffer[x+1])
                 self._tvertices.append(tvertex)
 
         # 2nd texture channel and colors
         if version > 25:
             num_t2verts = ts_alloc.read32()
             if parent_mesh < 0:
-                for _ in range(num_t2verts):
-                    tvertex = (ts_alloc.read_float(), ts_alloc.read_float())
+                t2verts_buffer = ts_alloc.read_float_list(num_t2verts*2)
+                for x in range(0, num_t2verts*2, 2):
+                    tvertex = (t2verts_buffer[x], t2verts_buffer[x+1])
                     self._t2vertices.append(tvertex)
 
             num_vcolors = ts_alloc.read32()
             if parent_mesh < 0:
-                for _ in range(num_vcolors):
-                    packed_color = ts_alloc.read32()
-
+                vcolors = ts_alloc.read32_list(num_vcolors)
+                for packed_color in vcolors:
                     red   =  packed_color & 0xFF
                     green = (packed_color >> 8)  & 0xFF
                     blue  = (packed_color >> 16) & 0xFF
@@ -127,16 +134,14 @@ class TSMesh:
 
 
         # normals
-        if version > 21:
-            if parent_mesh < 0:
-                for _ in range(num_verts):
-                    normal = (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
-                for _ in range(num_verts):
-                    ts_alloc.read8()  # encoded normals, skip
-        else:
-            if parent_mesh < 0:
-                for _ in range(num_verts):
-                    normal = (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
+        if parent_mesh < 0:
+            normals_buffer = ts_alloc.read_float_list(num_verts*3)
+            for x in range(0, num_verts*3, 3):
+                normal = (normals_buffer[x], normals_buffer[x+1], normals_buffer[x+2])
+                self._normals.append(normal)
+
+        if version > 21 and parent_mesh < 0:
+            ts_alloc.skip8(num_verts) # encoded normals, skip
 
         # primitives and indices
         sz_prim_in = 0
@@ -155,8 +160,7 @@ class TSMesh:
                 material_indices.append(ts_alloc.read32())
 
             sz_ind_in = ts_alloc.read32()
-            for _ in range(sz_ind_in):
-                self._indices.append(ts_alloc.read32())
+            self._indices.extend(ts_alloc.read32_list(sz_ind_in))
         else:
             # mesh primitives (start, numElements) indices are stored as 16 bit values
             sz_prim_in = ts_alloc.read32()
@@ -167,8 +171,7 @@ class TSMesh:
                 material_indices.append(ts_alloc.read32())
 
             sz_ind_in = ts_alloc.read32()
-            for _ in range(sz_ind_in):
-                self._indices.append(ts_alloc.read16())
+            self._indices.extend(ts_alloc.read16_list(sz_ind_in))
 
         # setup primitives from data
         for x in range(sz_prim_in):
@@ -181,8 +184,7 @@ class TSMesh:
 
         # merge indices (deprecated)
         num_merge_indices = ts_alloc.read32()
-        for _ in range(num_merge_indices):
-            ts_alloc.read16()
+        ts_alloc.skip16(num_merge_indices)
 
         ts_alloc.align32()
 
@@ -190,3 +192,41 @@ class TSMesh:
         flags = ts_alloc.read32()
 
         ts_alloc.check_guard()
+
+class TSSkinnedMesh(TSMesh):
+    def __init__(self):
+        super().__init__()
+
+    def assemble(self, ts_alloc, version):
+        super().assemble(ts_alloc, version)
+
+        maxBones = -1 if version < 27 else ts_alloc.read32()
+
+        if version < 27:
+            # get initial verts
+            sz = ts_alloc.read32()
+            if self._parent_mesh < 0:
+                ts_alloc.skip32(sz * 3) # initial verts
+
+            if version > 21:
+                if self._parent_mesh < 0:
+                    ts_alloc.skip32(sz * 3) # normals
+                    ts_alloc.skip8(sz) # encoded normals
+            else:
+                if self._parent_mesh < 0:
+                    ts_alloc.skip32(sz * 3) # normals
+
+        sz = ts_alloc.read32()
+        ts_alloc.skip32(16 * sz) # initial transforms
+
+        sz = ts_alloc.read32()
+        ts_alloc.skip32(sz) # vertex index list
+        ts_alloc.skip32(sz) # bone index list
+        ts_alloc.skip32(sz) # weight list
+
+        sz = ts_alloc.read32()
+        ts_alloc.skip32(sz) # node index list
+
+        ts_alloc.check_guard()
+
+
