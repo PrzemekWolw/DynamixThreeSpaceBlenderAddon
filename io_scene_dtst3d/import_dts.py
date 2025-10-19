@@ -226,11 +226,9 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
         key = prim.material_index
         if key in material_remap:
             return material_remap[key]
-        # Pick a name: existing material name if valid, otherwise a fallback
         if 0 <= key < len(shape.materials):
             mname = shape.materials[key].name
         else:
-            # Covers NoMaterial or exporter giving an invalid index
             mname = f"Mat_{key}"
         slot = len(material_remap)
         material_remap[key] = slot
@@ -277,7 +275,6 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
             except Exception as e:
                 print("Face add error:", e)
     else:
-        # One bm-vertex per original vertex
         vertices = [bm.verts.new(translate_vert(v)) for v in verts]
         def add_face_from_indices(i0, i1, i2, mat_slot):
             try:
@@ -645,7 +642,7 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         colors = _decode_color_bytes_to_rgba_floats(c_blob) if c_sz else []
 
         # Read normals so we can merge by (position,normal)
-        n_sz, n_es, n_blob = _read_packed_vector(u)  # normals (float3)
+        n_sz, n_es, n_blob = _read_packed_vector(u)  # normals
         norms = _unpack_array(n_blob, "fff") if n_sz else []
         _ = _read_packed_vector(u)  # encoded normals (skip)
 
@@ -686,7 +683,7 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         tm._tvertices = [tuple(t) for t in tverts]
         tm._t2vertices= [tuple(t) for t in t2verts]
         tm._colors    = colors
-        tm._indices   = tri_indices  # flat list of ints
+        tm._indices   = tri_indices
         tm._primitives= tri_prims
         tm._normals   = [tuple(n) for n in norms] if norms else []
         meshes.append(tm)
@@ -696,6 +693,7 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         for __ in range(15):
             _ = u.next()
 
+    # materials
     materials = []
     try:
         mcount = int(u.next())
@@ -706,6 +704,19 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         _ = int(u.next()); _ = int(u.next()); _ = int(u.next()); _ = int(u.next())
         _ = float(u.next()); _ = float(u.next())
         materials.append(TSMaterial(mname))
+
+    # Assign materials into the TSMaterialList (no direct setter -> clear+extend)
+    try:
+        mat_list = getattr(shape, "_material_list", None)
+        mats = getattr(mat_list, "materials", None)
+        if isinstance(mats, list):
+            mats.clear()
+            mats.extend(materials)
+        else:
+            # Fallback for older shapes
+            shape._materials = materials
+    except Exception:
+        shape._materials = materials
 
     shape._names = names
     shape._nodes = []
@@ -729,7 +740,6 @@ def _read_cdae_shape(filepath: str) -> TSShape:
         shape._objects.append(o)
 
     shape._meshes = meshes
-    shape._materials = materials
     return shape
 
 def load_cdae(filepath, context):
