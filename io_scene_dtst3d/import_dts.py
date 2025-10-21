@@ -770,8 +770,25 @@ def _read_header_v31(f):
 class _UnpackStream:
     def __init__(self, data: bytes):
         import msgpack
-        self._u = msgpack.Unpacker(strict_map_key=False, raw=False)
+        # Some msgpack builds (fallback.py) enforce conservative limits by default.
+        # Use very high limits and disable the overall buffer limit.
+        kwargs = dict(strict_map_key=False, raw=False)
+        caps = dict(
+            max_buffer_size=0,           # 0 = unlimited buffer
+            max_bin_len=2**31 - 1,
+            max_array_len=2**31 - 1,
+            max_map_len=2**31 - 1,
+            max_str_len=2**31 - 1,
+        )
+        for k, v in list(caps.items()):
+            try:
+                msgpack.Unpacker(**kwargs, **{k: v})
+                kwargs[k] = v
+            except TypeError:
+                pass
+        self._u = msgpack.Unpacker(**kwargs)
         self._u.feed(data)
+
     def next(self):
         return self._u.unpack()
 
