@@ -279,6 +279,11 @@ class TSShape:
             self._sequences.append(sequence)
         self._material_list.read(stream, version)
 
+        # postprocess: copy mesh data for parented meshes
+        for mesh in self._meshes:
+            if isinstance(mesh, TSMesh) and mesh.parent_mesh >= 0:
+                mesh.copy_vertex_data_from(self._meshes[mesh.parent_mesh])
+
     def read_from_path(self, path: str):
         with open(path, "rb") as f:
             self.read(f)

@@ -437,7 +437,7 @@ def _apply_skin_to_object(ob: bpy.types.Object, shape: TSShape, ts_mesh, arm_obj
 # ======================================================
 # Scene composition
 # ======================================================
-def _create_scene_from_shape(shape: TSShape):
+def _create_scene_from_shape(shape: TSShape, merge_verts: bool = True):
     scn = bpy.context.scene
     is_cdae = getattr(shape, "_from_cdae", False)
     # decide if we need an armature at all
@@ -494,7 +494,7 @@ def _create_scene_from_shape(shape: TSShape):
                 suffix = f"_a{int(round(det.size))}"
             name_override = prefix + base_name + suffix
             # For skinned meshes: DO NOT apply node transforms (avoid double-transform).
-            ob = create_mesh_object_from_shape_object(shape, shape_object, j, name_override=name_override)
+            ob = create_mesh_object_from_shape_object(shape, shape_object, j, name_override=name_override, merge_verts=merge_verts)
             if ob is not None:
                 created_any = True
                 # If the mesh is not skinned, parent under hierarchy and apply node transform (done in create_mesh_object).
@@ -513,7 +513,6 @@ def _create_scene_from_shape(shape: TSShape):
                 fallback.parent = parent_obj
                 fallback.matrix_parent_inverse = parent_obj.matrix_world.inverted()
             hierarchy[shape_object.node_index] = fallback
-    # After meshes exist: skin binding (only if an armature was created)
     if arm_obj is not None:
         for ob, ts_mesh in created:
             _apply_skin_to_object(ob, shape, ts_mesh, arm_obj)
@@ -522,7 +521,7 @@ def _create_scene_from_shape(shape: TSShape):
             build_actions_from_sequences(shape, arm_obj, fps=30.0)
     _create_detail_empties(shape)
 
-def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, name_override=None):
+def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, name_override=None, merge_verts: bool = True):
     scn = bpy.context.scene
     shape_node = shape.nodes[shape_object.node_index]
     base_name = shape.names[shape_object.name_index]
@@ -531,8 +530,8 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
     is_cdae = getattr(shape, "_from_cdae", False)
 
     material_remap = {}
-    me = bpy.data.meshes.new('DTSMesh' + str(shape_object.start_mesh_index + shape_mesh_index))
 
+    me = bpy.data.meshes.new('DTSMesh' + str(shape_object.start_mesh_index + shape_mesh_index))
     bm = bmesh.new()
     bm.from_mesh(me)
 
@@ -580,11 +579,13 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
     verts = shape_mesh.vertices
     norms = getattr(shape_mesh, "normals", [])
 
-    use_merge = norms and (len(norms) == len(verts))
+    # honor option: only merge if requested and normals are present per vertex
+    use_merge = bool(merge_verts) and norms and (len(norms) == len(verts))
 
     if use_merge:
         vert_remap = {}
         remapped_verts = []
+        merged_normals = []  # normals aligned to remapped_verts
 
         def get_merged_index(vidx: int) -> int:
             key = (verts[vidx], norms[vidx])
@@ -593,6 +594,7 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
                 idx = len(remapped_verts)
                 vert_remap[key] = idx
                 remapped_verts.append(bm.verts.new(translate_vert(verts[vidx])))
+                merged_normals.append(norms[vidx])
             return idx
 
         def add_face_from_indices(i0, i1, i2, mat_slot, prim_i):
@@ -693,18 +695,30 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
     bm.to_mesh(me)
     bm.free()
 
+    # custom split normals
     if getattr(shape_mesh, "normals", None) and len(shape_mesh.normals) == len(shape_mesh.vertices):
         try:
             ln = []
-            for loop in me.loops:
-                vi = loop.vertex_index
-                nx, ny, nz = shape_mesh.normals[vi]
-                ln.append((nx, ny, nz))
+            if use_merge:
+                # normals aligned with remapped (merged) vertex indices
+                # Build per-loop normals from merged_normals table
+                # Note: me.loops[].vertex_index indexes into final mesh verts which align with merged_normals
+                for loop in me.loops:
+                    vi = loop.vertex_index
+                    nx, ny, nz = merged_normals[vi]
+                    ln.append((nx, ny, nz))
+            else:
+                # 1:1 with original vertices order
+                for loop in me.loops:
+                    vi = loop.vertex_index
+                    nx, ny, nz = shape_mesh.normals[vi]
+                    ln.append((nx, ny, nz))
             me.use_auto_smooth = True
             me.normals_split_custom_set(ln)
         except Exception as e:
             print("Failed to set custom split normals:", e)
 
+    # write primitive/material face attributes (optional metadata)
     try:
         if poly_prim_idx and len(poly_prim_idx) == len(me.polygons):
             attr_p = me.attributes.get("ts_prim_index")
@@ -721,6 +735,7 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
     except Exception as e:
         print("Failed to write primitive/material face attributes:", e)
 
+    # shape keys for non-skinned meshes
     if isinstance(shape_mesh, TSMesh) and not isinstance(shape_mesh, TSSkinnedMesh):
         num_frames = getattr(shape_mesh, "num_frames", 1)
         base_count = len(shape_mesh.vertices)
@@ -742,17 +757,17 @@ def create_mesh_object_from_shape_object(shape, shape_object, shape_mesh_index, 
 # ======================================================
 # DTS import entry
 # ======================================================
-def read_dts_file(file, filepath):
+def read_dts_file(file, filepath, merge_verts: bool = True):
     shape = TSShape()
     shape.read_from_path(filepath)
-    _create_scene_from_shape(shape)
+    _create_scene_from_shape(shape, merge_verts=merge_verts)
 
-def load_dts(filepath, context):
+def load_dts(filepath, context, merge_verts: bool = True):
     print("importing DTS: %r..." % (filepath))
     t0 = time.perf_counter()
     with open(filepath, 'rb'):
         pass
-    read_dts_file(None, filepath)
+    read_dts_file(None, filepath, merge_verts=merge_verts)
     print(" done in %.4f sec." % (time.perf_counter() - t0))
 
 # ======================================================
@@ -1168,32 +1183,38 @@ def _read_cdae_shape(filepath: str) -> TSShape:
 
     return shape
 
-def load_cdae(filepath, context):
+def load_cdae(filepath, context, merge_verts: bool = True):
     print("importing CDAE: %r..." % (filepath))
     t0 = time.perf_counter()
     shape = _read_cdae_shape(filepath)
-    _create_scene_from_shape(shape)
+    _create_scene_from_shape(shape, merge_verts=merge_verts)
     print(" done in %.4f sec." % (time.perf_counter() - t0))
 
 # ======================================================
 # Unified loader
 # ======================================================
-def load(operator, context, filepath=""):
+def load(operator, context, filepath="", merge_verts: bool = True):
     try:
         ver = _detect_version(filepath)
     except Exception as e:
         operator.report({'ERROR'}, f"Cannot detect DTS/CDAE version: {e}")
         return {'CANCELLED'}
 
+    # allow operator to override merge_verts if it has the property
+    if hasattr(operator, "merge_verts"):
+        try:
+            merge_verts = bool(getattr(operator, "merge_verts"))
+        except Exception:
+            pass
     if ver == 30:
         operator.report({'ERROR'}, "Version 30 files are not supported.")
         return {'CANCELLED'}
 
     if ver >= 31:
-        load_cdae(filepath, context)
+        load_cdae(filepath, context, merge_verts=merge_verts)
         return {'FINISHED'}
     elif ver >= 19:
-        load_dts(filepath, context)
+        load_dts(filepath, context, merge_verts=merge_verts)
         return {'FINISHED'}
     else:
         operator.report({'ERROR'}, f"Unsupported DTS/CDAE version {ver} (too old).")
