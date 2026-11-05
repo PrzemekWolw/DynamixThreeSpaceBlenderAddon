@@ -1,0 +1,455 @@
+"""Build a Blender scene from a parsed TSShape.
+
+DTS and CDAE both land here. Node quaternions use the conjugate of the
+stored value because the engine's matrix builder writes the transpose of
+the usual rotation matrix, and both formats share that convention. Triangle
+winding is left as stored.
+"""
+
+import bpy
+import bmesh
+import mathutils
+
+from .tsshape import SequenceFlags, TQuaternion16, TSShape
+from .tsmesh import (
+    TSDrawPrimitiveType,
+    TSMesh,
+    TSMeshFlags,
+    TSSkinnedMesh,
+)
+
+
+def _triangle_strip(strip):
+    triangles = []
+    clockwise = False
+    for index in range(len(strip) - 2):
+        a, b, c = strip[index], strip[index + 1], strip[index + 2]
+        triangles.extend((b, a, c) if clockwise else (a, b, c))
+        clockwise = not clockwise
+    return triangles
+
+
+def _material(name):
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name=name)
+        material.diffuse_color = (1.0, 1.0, 1.0, 1.0)
+        material.specular_intensity = 0
+        material.use_nodes = True
+        material.use_backface_culling = True
+    return material
+
+
+def _quat_to_blender(quat16: TQuaternion16) -> mathutils.Quaternion:
+    scale = 1.0 / TQuaternion16.MAX_VALUE
+    return mathutils.Quaternion((
+        quat16.w * scale,
+        -quat16.x * scale,
+        -quat16.y * scale,
+        -quat16.z * scale,
+    ))
+
+
+def _node_matrix(node) -> mathutils.Matrix:
+    matrix = _quat_to_blender(node.rotation).to_matrix().to_4x4()
+    matrix.translation = mathutils.Vector(node.translation)
+    return matrix
+
+
+def _world_matrices(shape: TSShape):
+    cache = {}
+
+    def world(index):
+        if index in cache:
+            return cache[index]
+        node = shape.nodes[index]
+        local = _node_matrix(node)
+        matrix = world(node.parent_index) @ local if node.parent_index >= 0 else local
+        cache[index] = matrix
+        return matrix
+
+    return [world(index) for index in range(len(shape.nodes))]
+
+
+def _apply_node_transform(node, obj):
+    obj.location = node.translation
+    obj.rotation_mode = "QUATERNION"
+    obj.rotation_quaternion = _quat_to_blender(node.rotation)
+
+
+def _link(obj):
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _empty(name, node):
+    obj = _link(bpy.data.objects.new(name, None))
+    _apply_node_transform(node, obj)
+    return obj
+
+
+def _is_collision(name: str) -> bool:
+    return name.startswith(("colmesh", "colbox", "colsphere", "colcapsule"))
+
+
+def _is_utility_empty(name: str) -> bool:
+    if name == "bb_autobillboard" or name.startswith(("bb_", "nulldetail")):
+        return True
+    for prefix in ("base", "start", "abase", "astart"):
+        suffix = name[len(prefix):]
+        if name.startswith(prefix) and suffix.isdigit():
+            return True
+    return False
+
+
+def _name(shape, index, fallback):
+    if 0 <= index < len(shape.names):
+        return shape.names[index]
+    return fallback
+
+
+def _frame_slice(mesh: TSMesh):
+    total = len(mesh.vertices)
+    frames = mesh.num_frames if mesh.num_frames and mesh.num_frames > 1 else 1
+    per_frame = mesh.verts_per_frame
+    if frames > 1 and per_frame > 0 and total == per_frame * frames:
+        return per_frame, frames
+    return total, 1
+
+
+def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
+    mesh = shape.meshes[shape_object.start_mesh_index + mesh_index]
+    per_frame, frame_count = _frame_slice(mesh)
+    positions = mesh.vertices[:per_frame]
+    skinned = isinstance(mesh, TSSkinnedMesh)
+    # Influences address the original vertices, so a skinned mesh is not welded.
+    use_merge = bool(merge_verts) and not skinned and len(mesh.normals) >= per_frame
+
+    blend = bpy.data.meshes.new(f"DTSMesh{shape_object.start_mesh_index + mesh_index}")
+    bmesh_data = bmesh.new()
+    uv_layer = bmesh_data.loops.layers.uv.new() if len(mesh.tvertices) >= per_frame else None
+    uv2_layer = bmesh_data.loops.layers.uv.new("UV2") if len(mesh.t2vertices) >= per_frame else None
+    color_layer = bmesh_data.loops.layers.color.new() if len(mesh.colors) >= per_frame else None
+
+    obj = _link(bpy.data.objects.new(name, blend))
+    if skinned:
+        obj.rotation_mode = "QUATERNION"
+    else:
+        _apply_node_transform(shape.nodes[shape_object.node_index], obj)
+
+    merged_normals = []
+    if use_merge:
+        remap = {}
+        verts = []
+
+        def vertex(index):
+            key = (positions[index], mesh.normals[index])
+            found = remap.get(key)
+            if found is None:
+                found = len(verts)
+                remap[key] = found
+                verts.append(bmesh_data.verts.new(positions[index]))
+                merged_normals.append(mesh.normals[index])
+            return found
+    else:
+        verts = [bmesh_data.verts.new(position) for position in positions]
+
+        def vertex(index):
+            return index
+
+    slots = {}
+    prim_of_face = []
+    mat_of_face = []
+
+    def slot_for(primitive):
+        key = primitive.material_index
+        if key in slots:
+            return slots[key]
+        if 0 <= key < len(shape.materials):
+            material_name = shape.materials[key].name
+        else:
+            material_name = f"Mat_{key}"
+        slots[key] = len(slots)
+        obj.data.materials.append(_material(material_name))
+        return slots[key]
+
+    def add_face(i0, i1, i2, slot, prim_index):
+        try:
+            a, b, c = vertex(i0), vertex(i1), vertex(i2)
+            face = bmesh_data.faces.new((verts[a], verts[b], verts[c]))
+        except (IndexError, ValueError):
+            return
+        for loop, index in zip(face.loops, (i0, i1, i2)):
+            if uv_layer is not None:
+                u, v = mesh.tvertices[index]
+                loop[uv_layer].uv = (u, 1.0 - v)
+            if uv2_layer is not None:
+                u, v = mesh.t2vertices[index]
+                loop[uv2_layer].uv = (u, 1.0 - v)
+            if color_layer is not None:
+                loop[color_layer] = mesh.colors[index]
+        face.material_index = slot
+        face.smooth = True
+        prim_of_face.append(prim_index)
+        mat_of_face.append(slot)
+
+    for prim_index, primitive in enumerate(mesh.primitives):
+        slot = slot_for(primitive)
+        raw = mesh.indices[primitive.start:primitive.start + primitive.num_elements]
+        if primitive.type == TSDrawPrimitiveType.Triangles:
+            triples = raw
+        elif primitive.type == TSDrawPrimitiveType.Strip:
+            triples = _triangle_strip(raw)
+        else:
+            continue
+        for offset in range(0, len(triples) - 2, 3):
+            add_face(triples[offset], triples[offset + 1], triples[offset + 2], slot, prim_index)
+
+    bmesh_data.normal_update()
+    bmesh_data.to_mesh(blend)
+    bmesh_data.free()
+
+    if len(mesh.normals) >= per_frame:
+        try:
+            if use_merge:
+                loops = [merged_normals[loop.vertex_index] for loop in blend.loops]
+            else:
+                loops = [mesh.normals[loop.vertex_index] for loop in blend.loops]
+            blend.normals_split_custom_set(loops)
+        except (AttributeError, RuntimeError):
+            pass
+
+    _write_face_attribute(blend, "ts_prim_index", prim_of_face)
+    _write_face_attribute(blend, "ts_mat_index", mat_of_face)
+
+    if frame_count > 1 and not use_merge:
+        obj.shape_key_add(name="Basis", from_mix=False)
+        for frame in range(1, frame_count):
+            key = obj.shape_key_add(name=f"frame_{frame}", from_mix=False)
+            start = frame * per_frame
+            for index in range(per_frame):
+                key.data[index].co = mesh.vertices[start + index]
+    return obj
+
+
+def _write_face_attribute(blend, name, values):
+    if len(values) != len(blend.polygons):
+        return
+    try:
+        attribute = blend.attributes.get(name) or blend.attributes.new(name, type="INT", domain="FACE")
+        for index, value in enumerate(values):
+            attribute.data[index].value = int(value)
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def _armature(shape: TSShape):
+    arm = bpy.data.armatures.new("TS_Armature")
+    obj = _link(bpy.data.objects.new("TS_Armature", arm))
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    worlds = _world_matrices(shape)
+    bones = {}
+    for index, node in enumerate(shape.nodes):
+        bone = arm.edit_bones.new(_name(shape, node.name_index, f"bone_{index}"))
+        bone.head = worlds[index].translation
+        direction = worlds[index].to_3x3() @ mathutils.Vector((0.0, 0.05, 0.0))
+        if direction.length < 1e-6:
+            direction = mathutils.Vector((0.0, 0.05, 0.0))
+        bone.tail = bone.head + direction
+        bones[index] = bone
+    for index, node in enumerate(shape.nodes):
+        if node.parent_index >= 0:
+            bones[index].parent = bones.get(node.parent_index)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return obj
+
+
+def _bind_skin(obj, shape, mesh, arm):
+    if not isinstance(mesh, TSSkinnedMesh) or not mesh.node_index:
+        return
+    modifier = obj.modifiers.new("Armature", "ARMATURE")
+    modifier.object = arm
+    names = {}
+    for slot, node_index in enumerate(mesh.node_index):
+        if 0 <= node_index < len(shape.nodes):
+            names[slot] = _name(shape, shape.nodes[node_index].name_index, f"bone_{node_index}")
+    for bone_name in set(names.values()):
+        if bone_name not in obj.vertex_groups:
+            obj.vertex_groups.new(name=bone_name)
+    for vertex, bone, weight in zip(mesh.vertex_index, mesh.bone_index, mesh.weight):
+        bone_name = names.get(bone)
+        group = obj.vertex_groups.get(bone_name) if bone_name else None
+        if group is not None and weight > 0.0:
+            group.add([int(vertex)], float(weight), "ADD")
+
+
+def _key_sequences(shape: TSShape, arm, fps=30.0):
+    for sequence in shape.sequences:
+        seq_name = _name(shape, sequence.name_index, "Seq")
+        action = bpy.data.actions.new(name=f"TS_{seq_name}")
+        arm.animation_data_create()
+        arm.animation_data.action = action
+        keys = max(1, sequence.num_keyframes)
+        duration = max(0.0, sequence.duration)
+
+        def frame_of(key):
+            if keys <= 1:
+                return 1
+            return int(round(key * (duration / (keys - 1)) * fps) + 1)
+
+        for node_index, node in enumerate(shape.nodes):
+            pose = arm.pose.bones.get(_name(shape, node.name_index, f"bone_{node_index}"))
+            if pose is None:
+                continue
+            rest_quat = _quat_to_blender(node.rotation)
+            rest_pos = node.translation
+            rotates = sequence.rotation_matters.test(node_index)
+            moves = sequence.translation_matters.test(node_index)
+            scales = sequence.scale_matters.test(node_index)
+            rot_slot = sequence.rotation_matters.rank(node_index) if rotates else None
+            pos_slot = sequence.translation_matters.rank(node_index) if moves else None
+            scale_slot = sequence.scale_matters.rank(node_index) if scales else None
+            for key in range(keys):
+                frame = frame_of(key)
+                anim_quat = rest_quat
+                if rot_slot is not None:
+                    sample = sequence.base_rotation + rot_slot * keys + key
+                    if 0 <= sample < len(shape.anim_node_rotations):
+                        anim_quat = _quat_to_blender(shape.anim_node_rotations[sample])
+                anim_pos = rest_pos
+                if pos_slot is not None:
+                    sample = sequence.base_translation + pos_slot * keys + key
+                    if 0 <= sample < len(shape.anim_node_translations):
+                        anim_pos = shape.anim_node_translations[sample]
+                scale = _sample_scale(shape, sequence, scale_slot, keys, key)
+                pose.rotation_mode = "QUATERNION"
+                pose.rotation_quaternion = rest_quat.inverted() @ anim_quat
+                pose.location = (
+                    anim_pos[0] - rest_pos[0],
+                    anim_pos[1] - rest_pos[1],
+                    anim_pos[2] - rest_pos[2],
+                )
+                pose.scale = scale
+                pose.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                pose.keyframe_insert(data_path="location", frame=frame)
+                pose.keyframe_insert(data_path="scale", frame=frame)
+
+        track = arm.animation_data.nla_tracks.new()
+        track.name = action.name
+        strip = track.strips.new(action.name, 1, action)
+        strip.frame_end = max(2, round(duration * fps) + 1)
+
+
+def _sample_scale(shape, sequence, slot, keys, key):
+    if slot is None:
+        return (1.0, 1.0, 1.0)
+    sample = sequence.base_scale + slot * keys + key
+    if sequence.flags & SequenceFlags.UniformScale:
+        value = shape.anim_node_uniform_scales[sample] if 0 <= sample < len(shape.anim_node_uniform_scales) else 1.0
+        return (value, value, value)
+    if sequence.flags & SequenceFlags.AlignedScale and 0 <= sample < len(shape.anim_node_aligned_scales):
+        return tuple(shape.anim_node_aligned_scales[sample])
+    if sequence.flags & SequenceFlags.ArbitraryScale and 0 <= sample < len(shape.anim_node_arbitrary_scale_factors):
+        return tuple(shape.anim_node_arbitrary_scale_factors[sample])
+    return (1.0, 1.0, 1.0)
+
+
+def _detail_empties(shape: TSShape):
+    if not shape.details:
+        return
+    parent = bpy.data.objects.get("Details") or _link(bpy.data.objects.new("Details", None))
+    object_names = {_name(shape, obj.name_index, "") for obj in shape.objects}
+    for detail in shape.details:
+        name = _name(shape, detail.name_index, "")
+        lowered = name.lower()
+        if not name or lowered in object_names or _is_collision(lowered):
+            continue
+        if lowered != "bb_autobillboard" and not lowered.startswith(("bb_", "nulldetail")):
+            continue
+        empty = _link(bpy.data.objects.new(name, None))
+        empty["detail_size"] = float(detail.size)
+        empty["subshape"] = int(detail.sub_shape_num)
+        if detail.sub_shape_num < 0 or lowered.startswith("bb_"):
+            empty["bb_dimension"] = int(detail.billboard_dimension)
+            empty["bb_detail_level"] = int(detail.billboard_detail_level)
+            empty["bb_equator_steps"] = int(detail.billboard_equator_steps)
+            empty["bb_polar_steps"] = int(detail.billboard_polar_steps)
+            empty["bb_polar_angle"] = float(detail.billboard_polar_angle)
+            empty["bb_include_poles"] = int(detail.billboard_include_poles)
+        empty.parent = parent
+
+
+def _lod_name(base, mesh, detail):
+    prefix = ""
+    if mesh.flags & TSMeshFlags.BillboardZAxis:
+        prefix = "bbz_"
+    elif mesh.flags & TSMeshFlags.Billboard:
+        prefix = "bb_"
+    suffix = ""
+    if detail is not None and detail.size is not None and detail.size >= 10:
+        suffix = f"_a{int(round(detail.size))}"
+    return prefix + base + suffix
+
+
+def build_scene(shape: TSShape, merge_verts: bool = True):
+    skinned = any(isinstance(mesh, TSSkinnedMesh) for mesh in shape.meshes)
+    arm = _armature(shape) if (skinned or shape.sequences) and shape.nodes else None
+    hierarchy = {}
+    created = []
+
+    for obj_index, shape_object in enumerate(shape.objects):
+        base = _name(shape, shape_object.name_index, f"object_{obj_index}")
+        node = shape.nodes[shape_object.node_index]
+        parent = hierarchy.get(node.parent_index) if node.parent_index >= 0 else None
+
+        def hold(empty):
+            if parent is not None and empty is not None:
+                empty.parent = parent
+                bpy.context.view_layer.update()
+                empty.matrix_parent_inverse = parent.matrix_world.inverted()
+            hierarchy[shape_object.node_index] = empty
+
+        if _is_utility_empty(base.lower()) or shape_object.num_meshes <= 0:
+            hold(_empty(base, node))
+            continue
+
+        subshape = shape.get_sub_shape_for_object(obj_index)
+        details = {}
+        if subshape >= 0:
+            for detail in shape.get_sub_shape_details(subshape):
+                if detail.sub_shape_num == subshape and detail.object_detail_num >= 0:
+                    details[detail.object_detail_num] = detail
+
+        made_one = False
+        for mesh_index in range(shape_object.num_meshes):
+            global_index = shape_object.start_mesh_index + mesh_index
+            if global_index >= len(shape.meshes):
+                continue
+            mesh = shape.meshes[global_index]
+            if not isinstance(mesh, TSMesh) or not mesh.vertices:
+                continue
+            obj = _build_mesh_object(
+                shape, shape_object, mesh_index,
+                _lod_name(base, mesh, details.get(mesh_index)),
+                merge_verts,
+            )
+            made_one = True
+            if parent is not None and not isinstance(mesh, TSSkinnedMesh):
+                obj.parent = parent
+                bpy.context.view_layer.update()
+                obj.matrix_parent_inverse = parent.matrix_world.inverted()
+            # ID properties are signed 32-bit. Bit 31 is the billboard flag.
+            obj["ts_flags"] = int(mesh.flags) - (0x100000000 if mesh.flags >= 0x80000000 else 0)
+            if not isinstance(mesh, TSSkinnedMesh):
+                hierarchy[shape_object.node_index] = obj
+            created.append((obj, mesh))
+        if not made_one:
+            hold(_empty(base, node))
+
+    if arm is not None:
+        for obj, mesh in created:
+            _bind_skin(obj, shape, mesh, arm)
+        if shape.sequences:
+            _key_sequences(shape, arm)
+    _detail_empties(shape)

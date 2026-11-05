@@ -61,13 +61,33 @@ class TSAlloc:
         return values
 
     def read32_list(self, count: int):
+        if count == 0:
+            return []
         values = list(struct.unpack_from(f'<{count}i', self.data, self.ptr32))
         self.ptr32 += count * 4
         self.size += count * 4
         return values
 
+    def read_u32_list(self, count: int):
+        if count == 0:
+            return []
+        values = list(struct.unpack_from(f'<{count}I', self.data, self.ptr32))
+        self.ptr32 += count * 4
+        self.size += count * 4
+        return values
+
     def read16_list(self, count: int):
+        if count == 0:
+            return []
         values = list(struct.unpack_from(f'<{count}h', self.data, self.ptr16))
+        self.ptr16 += count * 2
+        self.size += count * 2
+        return values
+
+    def read_u16_list(self, count: int):
+        if count == 0:
+            return []
+        values = list(struct.unpack_from(f'<{count}H', self.data, self.ptr16))
         self.ptr16 += count * 2
         self.size += count * 2
         return values

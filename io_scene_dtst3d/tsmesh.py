@@ -1,7 +1,7 @@
-import struct
-from typing import List, BinaryIO
+from typing import List
 
-from io_scene_dtst3d.tsalloc import *
+from .tsalloc import *
+
 
 class TSDrawPrimitiveType:
     Triangles = 0 << 30
@@ -11,225 +11,300 @@ class TSDrawPrimitiveType:
     Indexed = 1 << 29
     NoMaterial = 1 << 28
 
-    MaterialMask = ~(Strip|Fan|Triangles|Indexed|NoMaterial)
-    TypeMask     = Strip|Fan|Triangles
+    TypeMask = Strip | Fan | Triangles
+    # Bits 28-31 are type flags. Keep this masked to 32 bits: Python's ~
+    # would otherwise sign-extend and corrupt fan primitives.
+    MaterialMask = (~(Strip | Fan | Triangles | Indexed | NoMaterial)) & 0xFFFFFFFF
+
+
+class TSMeshFlags:
+    # graphics/ts/tsMesh.h. These live in the high bits of the mesh flags word.
+    UseEncodedNormals = 1 << 28
+    BillboardZAxis = 1 << 29
+    HasDetailTexture = 1 << 30
+    Billboard = 1 << 31
+
 
 class TSDrawPrimitive:
     def __init__(self, start, num_elements, material_and_flags):
         self.start = start
         self.num_elements = num_elements
-        self.material_index = material_and_flags
-
-        self.has_no_material = (material_and_flags & TSDrawPrimitiveType.NoMaterial) == TSDrawPrimitiveType.NoMaterial
+        material_and_flags &= 0xFFFFFFFF
+        self.has_no_material = (material_and_flags & TSDrawPrimitiveType.NoMaterial) != 0
         self.type = material_and_flags & TSDrawPrimitiveType.TypeMask
         self.material_index = material_and_flags & TSDrawPrimitiveType.MaterialMask
+
 
 class TSNullMesh:
     pass
 
+
+def _triples(buffer):
+    return list(zip(buffer[0::3], buffer[1::3], buffer[2::3]))
+
+
+def _pairs(buffer):
+    return list(zip(buffer[0::2], buffer[1::2]))
+
+
 class TSMesh:
     def __init__(self):
-            self._vertices: List[tuple[float, float, float]] = []
-            self._tvertices: List[tuple[float, float]] = []
-            self._t2vertices: List[tuple[float, float]] = []
-            self._colors: List[tuple[float, float, float, float]] = []
-            self._normals: List[tuple[float, float, float]] = []
-            self._primitives: List[TSDrawPrimitive] = []
-            self._indices: List[int] = []
-            self._parent_mesh: int = -1
+        self._vertices: List[tuple] = []
+        self._tvertices: List[tuple] = []
+        self._t2vertices: List[tuple] = []
+        self._colors: List[tuple] = []
+        self._normals: List[tuple] = []
+        self._tangents: List[tuple] = []
+        self._primitives: List[TSDrawPrimitive] = []
+        self._indices: List[int] = []
+        self._parent_mesh: int = -1
+        self._flags: int = 0
+        self._num_frames: int = 1
+        self._num_mat_frames: int = 1
+        self._verts_per_frame: int = 0
 
     @property
-    def vertices(self) -> List[tuple[float, float, float]]:
+    def vertices(self):
         return self._vertices
-    
+
     @property
-    def normals(self) -> List[tuple[float, float, float]]:
+    def normals(self):
         return self._normals
-    
+
     @property
-    def tvertices(self) -> List[tuple[float, float]]:
+    def tangents(self):
+        return self._tangents
+
+    @property
+    def tvertices(self):
         return self._tvertices
-    
+
     @property
-    def t2vertices(self) -> List[tuple[float, float]]:
+    def t2vertices(self):
         return self._t2vertices
-    
+
     @property
-    def colors(self) -> List[tuple[float, float, float, float]]:
+    def colors(self):
         return self._colors
-    
+
     @property
-    def primitives(self) -> List[TSDrawPrimitive]:
+    def primitives(self):
         return self._primitives
-    
+
     @property
-    def indices(self) -> List[int]:
+    def indices(self):
         return self._indices
 
     @property
     def parent_mesh(self) -> int:
         return self._parent_mesh
-    
+
+    @property
+    def flags(self) -> int:
+        return self._flags
+
+    @property
+    def num_frames(self) -> int:
+        return self._num_frames
+
+    @property
+    def num_mat_frames(self) -> int:
+        return self._num_mat_frames
+
+    @property
+    def verts_per_frame(self) -> int:
+        return self._verts_per_frame
+
     def copy_vertex_data_from(self, other):
-        """Copies mesh vertex data from a parent mesh"""
         self._vertices = other._vertices.copy()
         self._tvertices = other._tvertices.copy()
         self._t2vertices = other._t2vertices.copy()
         self._colors = other._colors.copy()
         self._normals = other._normals.copy()
+        self._tangents = other._tangents.copy()
 
-    def assemble(self, ts_alloc, version):
+    def _read_owned(self, ts_alloc, count, width, unpack):
+        """Vertex arrays are in the buffer only for meshes with no parent."""
+        if self._parent_mesh < 0 and count:
+            return unpack(ts_alloc.read_float_list(count * width))
+        return []
+
+    def assemble(self, ts_alloc: TSAlloc, version: int):
         ts_alloc.check_guard()
 
-        num_frames = ts_alloc.read32()
-        num_mat_names = ts_alloc.read32()
-        parent_mesh = ts_alloc.read32()
+        self._num_frames = ts_alloc.read32()
+        self._num_mat_frames = ts_alloc.read32()
+        self._parent_mesh = ts_alloc.read32()
 
-        self._parent_mesh = parent_mesh
+        # bounds (6), center (3), radius
+        ts_alloc.skip32(10)
 
-        bounds = [ts_alloc.read_float() for _ in range(6)]
-        center = [ts_alloc.read_float() for _ in range(3)]
-        radius = ts_alloc.read_float()
+        # Torque3D 27/28 stored a vertex-offset header here. BeamNG's
+        # assemble_v29, which writes version 29, does not.
+        if 27 <= version < 29:
+            ts_alloc.skip32(3)
 
-        vert_offset = 0
-        offset_num_verts = 0
-        offset_vert_size = 0
-
-        if version >= 27:
-            vert_offset = ts_alloc.read32()
-            offset_num_verts = ts_alloc.read32()
-            offset_vert_size = ts_alloc.read32()
-
-        # verts and texture coords
         num_verts = ts_alloc.read32()
-
-        if parent_mesh < 0:
-            verts_buffer = ts_alloc.read_float_list(num_verts*3)
-            for x in range(0, num_verts*3, 3):
-                vertex = (verts_buffer[x], verts_buffer[x+1], verts_buffer[x+2])
-                self._vertices.append(vertex)
+        self._vertices = self._read_owned(ts_alloc, num_verts, 3, _triples)
 
         num_tverts = ts_alloc.read32()
-        if parent_mesh < 0:
-            tverts_buffer = ts_alloc.read_float_list(num_tverts*2)
-            for x in range(0, num_tverts*2, 2):
-                tvertex = (tverts_buffer[x], tverts_buffer[x+1])
-                self._tvertices.append(tvertex)
+        self._tvertices = self._read_owned(ts_alloc, num_tverts, 2, _pairs)
 
-        # 2nd texture channel and colors
         if version > 25:
             num_t2verts = ts_alloc.read32()
-            if parent_mesh < 0:
-                t2verts_buffer = ts_alloc.read_float_list(num_t2verts*2)
-                for x in range(0, num_t2verts*2, 2):
-                    tvertex = (t2verts_buffer[x], t2verts_buffer[x+1])
-                    self._t2vertices.append(tvertex)
+            self._t2vertices = self._read_owned(ts_alloc, num_t2verts, 2, _pairs)
 
-            num_vcolors = ts_alloc.read32()
-            if parent_mesh < 0:
-                vcolors = ts_alloc.read32_list(num_vcolors)
-                for packed_color in vcolors:
-                    red   =  packed_color & 0xFF
-                    green = (packed_color >> 8)  & 0xFF
-                    blue  = (packed_color >> 16) & 0xFF
-                    alpha = (packed_color >> 24) & 0xFF
+            num_colors = ts_alloc.read32()
+            if self._parent_mesh < 0 and num_colors:
+                for packed in ts_alloc.read_u32_list(num_colors):
+                    self._colors.append((
+                        (packed & 0xFF) / 255.0,
+                        ((packed >> 8) & 0xFF) / 255.0,
+                        ((packed >> 16) & 0xFF) / 255.0,
+                        ((packed >> 24) & 0xFF) / 255.0,
+                    ))
 
-                    self._colors.append((red / 255.0, green / 255.0, blue / 255.0, alpha / 255.0))
-
-        # normals
-        if parent_mesh < 0:
-            normals_buffer = ts_alloc.read_float_list(num_verts*3)
-            for x in range(0, num_verts*3, 3):
-                normal = (normals_buffer[x], normals_buffer[x+1], normals_buffer[x+2])
-                self._normals.append(normal)
-
-        if version > 21 and parent_mesh < 0:
-            ts_alloc.skip8(num_verts) # encoded normals, skip
-
-        # primitives and indices
-        sz_prim_in = 0
-        sz_ind_in = 0
+        self._normals = self._read_owned(ts_alloc, num_verts, 3, _triples)
+        if version > 21 and self._parent_mesh < 0:
+            ts_alloc.skip8(num_verts)
 
         starts = []
-        elements = []
-        material_indices = []
-        
+        counts = []
+        materials = []
         if version > 25:
-            # mesh primitives (start, numElements) and indices are stored as 32 bit values
-            sz_prim_in = ts_alloc.read32()
-            for _ in range(sz_prim_in):
+            prim_count = ts_alloc.read32()
+            for _ in range(prim_count):
                 starts.append(ts_alloc.read32())
-                elements.append(ts_alloc.read32())
-                material_indices.append(ts_alloc.read32())
-
-            sz_ind_in = ts_alloc.read32()
-            self._indices.extend(ts_alloc.read32_list(sz_ind_in))                
+                counts.append(ts_alloc.read32())
+                materials.append(ts_alloc.read32() & 0xFFFFFFFF)
+            index_count = ts_alloc.read32()
+            self._indices = ts_alloc.read_u32_list(index_count)
         else:
-            # mesh primitives (start, numElements) indices are stored as 16 bit values
-            sz_prim_in = ts_alloc.read32()
-            for _ in range(sz_prim_in):
+            prim_count = ts_alloc.read32()
+            for _ in range(prim_count):
                 starts.append(ts_alloc.read16())
-                elements.append(ts_alloc.read16())
-            for _ in range(sz_prim_in):
-                material_indices.append(ts_alloc.read32())
+                counts.append(ts_alloc.read16())
+            for _ in range(prim_count):
+                materials.append(ts_alloc.read32() & 0xFFFFFFFF)
+            index_count = ts_alloc.read32()
+            # Unsigned: a signed 16-bit read turns indices past 32767 negative.
+            self._indices = ts_alloc.read_u16_list(index_count)
 
-            sz_ind_in = ts_alloc.read32()
-            self._indices.extend(ts_alloc.read16_list(sz_ind_in))
+        for start, count, material in zip(starts, counts, materials):
+            self._primitives.append(TSDrawPrimitive(start, count, material))
 
-        # setup primitives from data
-        for x in range(sz_prim_in):
-            start = starts[x]
-            num_elements = elements[x]
-            material_index = material_indices[x]
-
-            prim = TSDrawPrimitive(start, num_elements, material_index)
-            self._primitives.append(prim)
-            
-        # merge indices (deprecated)
-        num_merge_indices = ts_alloc.read32()
-        ts_alloc.skip16(num_merge_indices)
-
+        merge_count = ts_alloc.read32()
+        ts_alloc.skip16(merge_count)
         ts_alloc.align32()
 
-        verts_per_frame = ts_alloc.read32()
-        flags = ts_alloc.read32()
+        self._verts_per_frame = ts_alloc.read32()
+        self._flags = ts_alloc.read32() & 0xFFFFFFFF
+
+        # Point4F tangents, present from the BeamNG version 28 reader onward
+        # and written by every version 29 shape. Owned by the parent mesh.
+        if version >= 29:
+            tangent_count = ts_alloc.read32()
+            if self._parent_mesh < 0 and tangent_count:
+                raw = ts_alloc.read_float_list(tangent_count * 4)
+                self._tangents = list(zip(raw[0::4], raw[1::4], raw[2::4], raw[3::4]))
 
         ts_alloc.check_guard()
+
 
 class TSSkinnedMesh(TSMesh):
     def __init__(self):
         super().__init__()
+        self._initial_transforms: List[List[float]] = []
+        self._vertex_index: List[int] = []
+        self._bone_index: List[int] = []
+        self._weight: List[float] = []
+        self._node_index: List[int] = []
 
-    def assemble(self, ts_alloc, version):
+    @property
+    def initial_transforms(self):
+        return self._initial_transforms
+
+    @property
+    def vertex_index(self):
+        return self._vertex_index
+
+    @property
+    def bone_index(self):
+        return self._bone_index
+
+    @property
+    def weight(self):
+        return self._weight
+
+    @property
+    def node_index(self):
+        return self._node_index
+
+    def copy_skin_from(self, other):
+        self._initial_transforms = [row.copy() for row in other._initial_transforms]
+        self._vertex_index = other._vertex_index.copy()
+        self._bone_index = other._bone_index.copy()
+        self._weight = other._weight.copy()
+        self._node_index = other._node_index.copy()
+
+    def assemble(self, ts_alloc: TSAlloc, version: int):
         super().assemble(ts_alloc, version)
-
-        maxBones = -1 if version < 27 else ts_alloc.read32()
-
-        if version < 27:
-            # get initial verts
-            sz = ts_alloc.read32()
-            if self._parent_mesh < 0:
-                ts_alloc.skip32(sz * 3) # initial verts
-
-            if version > 21:
-                if self._parent_mesh < 0:
-                    ts_alloc.skip32(sz * 3) # normals
-                    ts_alloc.skip8(sz) # encoded normals
-            else:
-                if self._parent_mesh < 0:
-                    ts_alloc.skip32(sz * 3) # normals
-
-        sz = ts_alloc.read32()
-        ts_alloc.skip32(16 * sz) # initial transforms
-
-        sz = ts_alloc.read32()
-        ts_alloc.skip32(sz) # vertex index list
-        ts_alloc.skip32(sz) # bone index list
-        ts_alloc.skip32(sz) # weight list
-
-        sz = ts_alloc.read32()
-        ts_alloc.skip32(sz) # node index list
-
+        if version >= 29:
+            self._read_influences_v29(ts_alloc, version)
+        else:
+            self._read_influences_legacy(ts_alloc, version)
         ts_alloc.check_guard()
 
-    
+    def _read_influences_v29(self, ts_alloc: TSAlloc, version: int):
+        # Same layout as TSSkinMesh::assemble_v29. Every count is present;
+        # the arrays themselves are only stored when parentMesh < 0.
+        initial_verts = ts_alloc.read32()
+        if self._parent_mesh < 0:
+            ts_alloc.skip32(initial_verts * 3)
+            if version > 21:
+                ts_alloc.skip32(initial_verts * 3)
+                ts_alloc.skip8(initial_verts)
+            else:
+                ts_alloc.skip32(initial_verts * 3)
+
+        transform_count = ts_alloc.read32()
+        if self._parent_mesh < 0 and transform_count:
+            raw = ts_alloc.read_float_list(transform_count * 16)
+            self._initial_transforms = [raw[i * 16:(i + 1) * 16] for i in range(transform_count)]
+
+        influence_count = ts_alloc.read32()
+        if self._parent_mesh < 0:
+            self._vertex_index = ts_alloc.read_u32_list(influence_count)
+            self._bone_index = ts_alloc.read_u32_list(influence_count)
+            self._weight = ts_alloc.read_float_list(influence_count)
+
+        node_count = ts_alloc.read32()
+        if self._parent_mesh < 0:
+            self._node_index = ts_alloc.read_u32_list(node_count)
+
+    def _read_influences_legacy(self, ts_alloc: TSAlloc, version: int):
+        # Torque3D layout used before BeamNG's version 29 writer.
+        if version >= 27:
+            ts_alloc.read32()  # maxBones
+        if version < 27:
+            initial_verts = ts_alloc.read32()
+            if self._parent_mesh < 0:
+                ts_alloc.skip32(initial_verts * 3)
+                if version > 21:
+                    ts_alloc.skip32(initial_verts * 3)
+                    ts_alloc.skip8(initial_verts)
+                else:
+                    ts_alloc.skip32(initial_verts * 3)
+
+        transform_count = ts_alloc.read32()
+        if transform_count:
+            raw = ts_alloc.read_float_list(transform_count * 16)
+            self._initial_transforms = [raw[i * 16:(i + 1) * 16] for i in range(transform_count)]
+
+        influence_count = ts_alloc.read32()
+        self._vertex_index = ts_alloc.read_u32_list(influence_count)
+        self._bone_index = ts_alloc.read_u32_list(influence_count)
+        self._weight = ts_alloc.read_float_list(influence_count)
+
+        node_count = ts_alloc.read32()
+        self._node_index = ts_alloc.read_u32_list(node_count)

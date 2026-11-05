@@ -1,69 +1,50 @@
-bl_info = {
-    "name": "Dynamix Three Space",
-    "author": "Dummiesman",
-    "version": (0, 0, 5),
-    "blender": (3, 6, 0),
-    "location": "File > Import-Export",
-    "description": "Import Dynamix Three Space (DTS) models from Torque3D",
-    "warning": "",
-    "doc_url": "https://github.com/Dummiesman/DynamixThreeSpaceBlenderAddon/",
-    "tracker_url": "https://github.com/Dummiesman/DynamixThreeSpaceBlenderAddon/",
-    "support": 'COMMUNITY',
-    "category": "Import-Export"}
+try:
+    import bpy
+    from bpy.props import BoolProperty, StringProperty
+    from bpy_extras.io_utils import ImportHelper
+except ImportError:  # so the readers can be checked without Blender
+    bpy = None
 
-import bpy
 
-from bpy.props import (
-        BoolProperty,
-        EnumProperty,
-        FloatProperty,
-        StringProperty,
-        CollectionProperty,
-        PointerProperty,
-        )
-from bpy_extras.io_utils import (
-        ImportHelper,
-        ExportHelper,
+if bpy is not None:
+    class ImportDTS(bpy.types.Operator, ImportHelper):
+        """Import a Torque3D DTS shape or a BeamNG cache Collada shape"""
+        bl_idname = "import_scene.dtst3d"
+        bl_label = "Import Dynamix Three Space / CDAE"
+        bl_options = {"UNDO"}
+
+        filename_ext = ".dts;.cdae"
+        filter_glob: StringProperty(default="*.dts;*.cdae", options={"HIDDEN"})
+
+        merge_verts: BoolProperty(
+            name="Merge Vertices",
+            description="Weld vertices that share a position and a normal. Skinned meshes are left unwelded so bone weights keep their vertex indices",
+            default=True,
         )
 
-class ImportDTS(bpy.types.Operator, ImportHelper):
-    """Import from Dynamix Three Space (.DTS)"""
-    bl_idname = "import_scene.dtst3d"
-    bl_label = 'Import Dynamix Three Space'
-    bl_options = {'UNDO'}
+        def execute(self, context):
+            from . import import_dts
+            keywords = self.as_keywords(ignore=(
+                "axis_forward",
+                "axis_up",
+                "filter_glob",
+                "check_existing",
+            ))
+            return import_dts.load(self, context, **keywords)
 
-    filename_ext = ".dts"
-    filter_glob: StringProperty(default="*.dts", options={'HIDDEN'})
+    def menu_func_import(self, context):
+        del context
+        self.layout.separator()
+        self.layout.operator(ImportDTS.bl_idname, text="Dynamix Three Space / Cache Collada (.dts, .cdae)")
+        self.layout.separator()
 
-    merge_verts: BoolProperty(
-        name="Merge Vertices",
-        description="The DTS format requires discontinuous normals, UVs, and other vertex attributes to be stored as separate vertices as required for rendering on typical graphics hardware. This option attempts to combine co-located vertices where possible.",
-        default=True,
-        )
-    
-    def execute(self, context):
-        from . import import_dts
-        keywords = self.as_keywords(ignore=("axis_forward",
-                                            "axis_up",
-                                            "filter_glob",
-                                            "check_existing",
-                                            ))
+    def register():
+        bpy.utils.register_class(ImportDTS)
+        bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
-        return import_dts.load(self, context, **keywords)
-    
-def menu_func_import(self, context):
-    self.layout.separator()
-    self.layout.operator(ImportDTS.bl_idname, text="Dynamix Three Space (*.dts)")
-    self.layout.separator()
+    def unregister():
+        bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+        bpy.utils.unregister_class(ImportDTS)
 
-# Register factories
-def register():
-    bpy.utils.register_class(ImportDTS)
-    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
-
-def unregister():
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    bpy.utils.unregister_class(ImportDTS)
-
-if __name__ == "__main__":
-    register()
+    if __name__ == "__main__":
+        register()

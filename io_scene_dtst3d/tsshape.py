@@ -1,10 +1,10 @@
 import struct
 from typing import List, BinaryIO
 
-from io_scene_dtst3d.tsmesh import *
-from io_scene_dtst3d.tsalloc import *
-from io_scene_dtst3d.tsmateriallist import *
-from io_scene_dtst3d.integerset import *
+from .tsmesh import *
+from .tsalloc import *
+from .tsmateriallist import *
+from .integerset import *
 
 #from tsmesh import *
 class MeshType:
@@ -139,6 +139,7 @@ class ShapeSequence:
         self.base_translation : int = -1
         self.base_scale : int = -1
         self.base_object_state : int = -1
+        self.base_decal_state : int = -1
         self.first_trigger : int = -1
         self.num_triggers : int = 0
         self.num_keyframes : int = 0
@@ -182,12 +183,12 @@ class ShapeSequence:
             self.base_translation = struct.unpack('<i', reader.read(4))[0]
             self.base_scale = struct.unpack('<i', reader.read(4))[0]
             self.base_object_state = struct.unpack('<i', reader.read(4))[0]
-            base_decal_state = struct.unpack('<i', reader.read(4))[0] # DEPRECATED
+            self.base_decal_state = struct.unpack('<i', reader.read(4))[0]
         else:
             self.base_rotation = struct.unpack('<i', reader.read(4))[0]
             self.base_translation = self.base_rotation
             self.base_object_state = struct.unpack('<i', reader.read(4))[0]
-            base_decal_state = struct.unpack('<i', reader.read(4))[0] # DEPRECATED
+            self.base_decal_state = struct.unpack('<i', reader.read(4))[0]
 
         self.first_trigger = struct.unpack('<i', reader.read(4))[0]
         self.num_triggers = struct.unpack('<L', reader.read(4))[0]
@@ -224,6 +225,13 @@ class TSShape:
         self._sub_shape_num_nodes : List[int] = []
         self._sub_shape_first_object : List[int] = []
         self._sub_shape_num_objects : List[int] = []
+        self._version: int = 0
+        self._anim_node_rotations: List[TQuaternion16] = []
+        self._anim_node_translations: List[tuple] = []
+        self._anim_node_uniform_scales: List[float] = []
+        self._anim_node_aligned_scales: List[tuple] = []
+        self._anim_node_arbitrary_scale_rot: List[TQuaternion16] = []
+        self._anim_node_arbitrary_scale_factors: List[tuple] = []
 
     @property
     def sequences(self) -> List[ShapeSequence]:
@@ -252,6 +260,34 @@ class TSShape:
     @property
     def names(self) -> List[str]:
         return self._names
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    @property
+    def anim_node_rotations(self):
+        return self._anim_node_rotations
+
+    @property
+    def anim_node_translations(self):
+        return self._anim_node_translations
+
+    @property
+    def anim_node_uniform_scales(self):
+        return self._anim_node_uniform_scales
+
+    @property
+    def anim_node_aligned_scales(self):
+        return self._anim_node_aligned_scales
+
+    @property
+    def anim_node_arbitrary_scale_factors(self):
+        return self._anim_node_arbitrary_scale_factors
+
+    @property
+    def anim_node_arbitrary_scale_rot(self):
+        return self._anim_node_arbitrary_scale_rot
 
     def get_sub_shape_for_node(self, node_index) -> int:
         for x in range(len(self._sub_shape_first_node)):
@@ -284,8 +320,17 @@ class TSShape:
 
         if version < 19:
             raise Exception("This DTS file is too old")
-        if version >= 27:
-            raise Exception(f"This DTS file is too new (version {version}), please file an issue report with the problem file attached.")
+        if version >= 30:
+            raise Exception(f"Version {version} is not a binary DTS shape")
+        self._version = version
+
+        # Version 29 prefixes the memory buffers with the object names so a
+        # loader can list them without unpacking the shape.
+        if version >= 29:
+            name_count = struct.unpack('<i', reader.read(4))[0]
+            for _ in range(name_count):
+                name_len = struct.unpack('<I', reader.read(4))[0]
+                reader.read(name_len)
 
         size_mem_buffer = struct.unpack('<i', reader.read(4))[0]
         start_u16 = struct.unpack('<i', reader.read(4))[0]
@@ -306,10 +351,30 @@ class TSShape:
         # materials
         self._material_list.read(stream, version)
 
-        # postprocess: copy mesh data for parented meshes
+        # Versions before 22 index rotations and translations into an array
+        # that still has the default node transforms in front of the keys.
+        if version < 22:
+            for sequence in self._sequences:
+                sequence.base_translation -= len(self._nodes)
+                sequence.base_rotation -= len(self._nodes)
+                sequence.base_scale = 0
+
+        self.resolve_parent_meshes()
+
+    def resolve_parent_meshes(self):
+        """Copy vertex and skin data onto meshes that only reference a parent."""
         for mesh in self._meshes:
-            if isinstance(mesh, TSMesh) and mesh.parent_mesh >= 0:
-                mesh.copy_vertex_data_from(self._meshes[mesh.parent_mesh])
+            if not isinstance(mesh, TSMesh) or mesh.parent_mesh < 0:
+                continue
+            if not (0 <= mesh.parent_mesh < len(self._meshes)):
+                continue
+            parent = self._meshes[mesh.parent_mesh]
+            if not isinstance(parent, TSMesh):
+                continue
+            if not mesh.vertices:
+                mesh.copy_vertex_data_from(parent)
+            if isinstance(mesh, TSSkinnedMesh) and isinstance(parent, TSSkinnedMesh) and not mesh.vertex_index:
+                mesh.copy_skin_from(parent)
 
     def read_from_path(self, path: str):
         with open(path, "rb") as f:
@@ -383,8 +448,8 @@ class TSShape:
 
         ts_alloc.check_guard()
 
-        # Deprecated IFL decals
-        for _ in range(num_decals):
+        # Deprecated IFL materials. Count is numIflMaterials, not numDecals.
+        for _ in range(num_ifl_materials):
             for _ in range(5):
                 ts_alloc.read32()
 
@@ -417,32 +482,33 @@ class TSShape:
         for x in range(num_nodes):
             self._nodes[x].translation = (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
 
-        # Node sequence data
-        for _ in range(num_node_trans):
-            for _ in range(3):
-                ts_alloc.read32()
-
-        for _ in range(num_node_rots):
-            for _ in range(4):
-                ts_alloc.read16()
+        # Node sequence data. These are the keyframes sequences index into.
+        self._anim_node_translations = [
+            (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
+            for _ in range(num_node_trans)
+        ]
+        self._anim_node_rotations = [
+            TQuaternion16(ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16())
+            for _ in range(num_node_rots)
+        ]
 
         ts_alloc.align32()
         ts_alloc.check_guard()
 
         if version > 21:
-            for _ in range(num_node_uniform_scales):
-                ts_alloc.read32()
-
-            for _ in range(num_node_aligned_scales):
-                for _ in range(3):
-                    ts_alloc.read32()
-
-            for _ in range(num_node_arbitrary_scales):
-                for _ in range(3):
-                    ts_alloc.read32()
-            for _ in range(num_node_arbitrary_scales):
-                for _ in range(4):
-                    ts_alloc.read16()
+            self._anim_node_uniform_scales = [ts_alloc.read_float() for _ in range(num_node_uniform_scales)]
+            self._anim_node_aligned_scales = [
+                (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
+                for _ in range(num_node_aligned_scales)
+            ]
+            self._anim_node_arbitrary_scale_factors = [
+                (ts_alloc.read_float(), ts_alloc.read_float(), ts_alloc.read_float())
+                for _ in range(num_node_arbitrary_scales)
+            ]
+            self._anim_node_arbitrary_scale_rot = [
+                TQuaternion16(ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16(), ts_alloc.read16())
+                for _ in range(num_node_arbitrary_scales)
+            ]
 
             ts_alloc.align32()
             ts_alloc.check_guard()
@@ -477,9 +543,6 @@ class TSShape:
             self._details.append(detail)
 
         ts_alloc.check_guard()
-
-        if version >= 27:
-            raise NotImplementedError("Vertex format")
 
         # Meshes
         for _ in range(num_meshes):

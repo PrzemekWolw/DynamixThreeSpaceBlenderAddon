@@ -1,26 +1,41 @@
-# Dynamix Three SpaceBlender Addon
-Import Dynamix Three Space (DTS) models from Torque3D into Blender
-It can import 2 UV channels, vertex colors, object position and rotation
+# Dynamix Three Space Blender Extension
 
-It can import material names, but material parameters (such as color) are not currently imported
+Import Dynamix Three Space (DTS) models from Torque3D and BeamNG.drive, and BeamNG cache Collada (`.cdae`, format version 31), into Blender.
 
-## Version Support
-Versions 19, 20, 21, 22, 23, 24, 25, and 26 should function.
+The importer reads two UV channels, vertex colors, node translation and rotation, level of detail, collision meshes, skinned meshes, and sequence keyframes. Material names are imported. Material parameters such as color are not.
 
-The code is based off the Torque3D source code so adding in newer versions should be relatively easy
+## Version support
 
-## Limitations
-Only the first mesh on an object is imported at the moment
+DTS versions 19 through 26, BeamNG DTS version 29, and CDAE version 31. Version 30 is not a readable shape format.
+
+Blender 4.2 or newer. The extension is built for 64-bit x86 and arm64 on Windows, Linux, and macOS.
 
 ## Installation
-1. Grab the latest `io_scene_dtst3d.zip` here https://github.com/Dummiesman/DynamixThreeSpaceBlenderAddon/releases
-2. In Blender, select Edit > Preferences
-3. Select the Add-Ons tab
-4. Click Install in the top right corner
-5. Select the ZIP file
 
+1. Download the extension zip for your platform from the [releases](https://github.com/PrzemekWolw/DynamixThreeSpaceBlenderAddon/releases).
+2. In Blender, open Edit > Preferences > Get Extensions.
+3. Open the dropdown at the top right and choose Install from Disk.
+4. Select the zip.
 
-**Important:** The add-on was developed on Blender 3.6. While it's not a strict requirement you use this version, other versions may not work correctly. I have tested it on Blender 4.1 briefely and it appeared to work, however.
+## Building from source
 
+CDAE files are a MessagePack stream, compressed with Zstandard once the body is large. Those two libraries are not bundled in Blender, and the wheel files are not committed. `tools/fetch_wheels.py` downloads pinned `msgpack` and `zstandard` wheels for all six platforms into `io_scene_dtst3d/wheels/` and writes them into `blender_manifest.toml`.
 
-<img width="916" height="544" alt="image" src="https://github.com/user-attachments/assets/9eb9d512-53ef-4617-80b3-70c86c095977" />
+```
+python tools/fetch_wheels.py
+blender --command extension build --source-dir io_scene_dtst3d --output-dir dist --split-platforms
+```
+
+The default is CPython 3.11, which Blender 4.2 through 4.5 embed. For a newer Blender, pass the Python version it embeds:
+
+```
+python tools/fetch_wheels.py --python-version 3.13
+```
+
+`--split-platforms` writes one zip per OS and architecture, each containing only the wheels that platform can load. A macOS universal2 wheel, when a package publishes one, is shared by both macOS zips.
+
+To check that a folder of shapes parses, without opening Blender:
+
+```
+python tools/parse_check.py path\to\shapes
+```
