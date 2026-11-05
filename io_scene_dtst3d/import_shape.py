@@ -2,8 +2,9 @@
 
 DTS and CDAE both land here. Node quaternions use the conjugate of the
 stored value because the engine's matrix builder writes the transpose of
-the usual rotation matrix, and both formats share that convention. Triangle
-winding is left as stored.
+the usual rotation matrix, and both formats share that convention. The
+engine's front face is clockwise, so each triangle is reversed for
+Blender, whose front face is counter-clockwise.
 """
 
 import bpy
@@ -203,7 +204,7 @@ def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
         else:
             continue
         for offset in range(0, len(triples) - 2, 3):
-            add_face(triples[offset], triples[offset + 1], triples[offset + 2], slot, prim_index)
+            add_face(triples[offset + 2], triples[offset + 1], triples[offset], slot, prim_index)
 
     bmesh_data.normal_update()
     bmesh_data.to_mesh(blend)
