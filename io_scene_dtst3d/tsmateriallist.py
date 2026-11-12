@@ -41,7 +41,7 @@ class TSMaterialList:
         for _ in range(mat_count):
             mat_name_length = struct.unpack('<B', reader.read(1))[0]
             mat_name_bytes = reader.read(mat_name_length)
-            mat_name = mat_name_bytes.decode('utf-8')
+            mat_name = mat_name_bytes.decode('utf-8').replace('\\', '/').rsplit('/', 1)[-1]
             
             self._materials.append(TSMaterial(mat_name))
 

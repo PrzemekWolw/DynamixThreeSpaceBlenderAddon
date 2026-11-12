@@ -434,11 +434,6 @@ class TSShape:
             obj.assemble(ts_alloc)
             self._objects.append(obj)
 
-        if num_skins > 0:
-            for _ in range(num_skins):
-                for _ in range(6):
-                    ts_alloc.read32()
-
         ts_alloc.check_guard()
 
         # Deprecated decals
@@ -546,24 +541,23 @@ class TSShape:
 
         # Meshes
         for _ in range(num_meshes):
-            mesh_type_raw = ts_alloc.read32()
-
-            mesh_type = mesh_type_raw & MeshType.TypeMask
-            mesh_flags = mesh_type_raw & ~MeshType.TypeMask
+            mesh_type = ts_alloc.read32() & MeshType.TypeMask
 
             if mesh_type == MeshType.StandardMeshType:
                 mesh = TSMesh()
-                mesh.assemble(ts_alloc, version)
-                self._meshes.append(mesh)
-            elif mesh_type == MeshType.NullMeshType:
-                mesh = TSNullMesh()
-                self._meshes.append(mesh)
+            elif mesh_type == MeshType.SortedMeshType:
+                mesh = TSSortedMesh()
             elif mesh_type == MeshType.SkinMeshType:
                 mesh = TSSkinnedMesh()
-                mesh.assemble(ts_alloc, version)
-                self._meshes.append(mesh)
+            elif mesh_type == MeshType.DecalMeshType:
+                mesh = TSDecalMesh()
+            elif mesh_type == MeshType.NullMeshType:
+                mesh = TSNullMesh()
             else:
                 raise NotImplementedError(f"Can't parse mesh of type {mesh_type}")
+            if mesh_type != MeshType.NullMeshType:
+                mesh.assemble(ts_alloc, version)
+            self._meshes.append(mesh)
 
         ts_alloc.check_guard()
 
@@ -582,8 +576,8 @@ class TSShape:
 
         if version < 23:
             # read skinned meshes from old versions
-            ts_alloc.skip32(num_skins) # detail first skin
-            ts_alloc.skip32(num_skins) # detail num skins
+            ts_alloc.skip32(num_details) # detail first skin
+            ts_alloc.skip32(num_details) # detail num skins
 
             ts_alloc.check_guard()
 

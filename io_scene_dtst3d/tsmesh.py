@@ -39,6 +39,28 @@ class TSNullMesh:
     pass
 
 
+class TSDecalMesh(TSNullMesh):
+    """Decal meshes carry no geometry the importer uses; this only moves past them."""
+
+    def assemble(self, ts_alloc, version: int):
+        if version < 20:
+            ts_alloc.check_guard()
+            ts_alloc.skip32(15)
+        primitive_count = ts_alloc.read32()
+        ts_alloc.skip16(primitive_count * 2)
+        ts_alloc.skip32(primitive_count)
+        ts_alloc.skip16(ts_alloc.read32())
+        if version < 20:
+            ts_alloc.skip32(3)
+            ts_alloc.check_guard()
+        start_count = ts_alloc.read32()
+        ts_alloc.skip32(start_count)
+        if version >= 19:
+            ts_alloc.skip32(start_count * 8)
+        ts_alloc.read32()  # material index
+        ts_alloc.check_guard()
+
+
 def _triples(buffer):
     return list(zip(buffer[0::3], buffer[1::3], buffer[2::3]))
 
@@ -139,11 +161,6 @@ class TSMesh:
         # bounds (6), center (3), radius
         ts_alloc.skip32(10)
 
-        # Torque3D 27/28 stored a vertex-offset header here. BeamNG's
-        # assemble_v29, which writes version 29, does not.
-        if 27 <= version < 29:
-            ts_alloc.skip32(3)
-
         num_verts = ts_alloc.read32()
         self._vertices = self._read_owned(ts_alloc, num_verts, 3, _triples)
 
@@ -200,14 +217,25 @@ class TSMesh:
         self._verts_per_frame = ts_alloc.read32()
         self._flags = ts_alloc.read32() & 0xFFFFFFFF
 
-        # Point4F tangents, present from the BeamNG version 28 reader onward
-        # and written by every version 29 shape. Owned by the parent mesh.
-        if version >= 29:
+        # Point4F tangents, present from version 28 onward. Owned by the parent mesh.
+        if version >= 28:
             tangent_count = ts_alloc.read32()
             if self._parent_mesh < 0 and tangent_count:
                 raw = ts_alloc.read_float_list(tangent_count * 4)
                 self._tangents = list(zip(raw[0::4], raw[1::4], raw[2::4], raw[3::4]))
 
+        ts_alloc.check_guard()
+
+
+class TSSortedMesh(TSMesh):
+    """A standard mesh followed by translucency cluster data the importer does not use."""
+
+    def assemble(self, ts_alloc: TSAlloc, version: int):
+        super().assemble(ts_alloc, version)
+        ts_alloc.skip32(ts_alloc.read32() * 8)  # clusters
+        for _ in range(4):  # startCluster, firstVerts, numVerts, firstTVerts
+            ts_alloc.skip32(ts_alloc.read32())
+        ts_alloc.read32()  # alwaysWriteDepth
         ts_alloc.check_guard()
 
 
@@ -249,15 +277,8 @@ class TSSkinnedMesh(TSMesh):
 
     def assemble(self, ts_alloc: TSAlloc, version: int):
         super().assemble(ts_alloc, version)
-        if version >= 29:
-            self._read_influences_v29(ts_alloc, version)
-        else:
-            self._read_influences_legacy(ts_alloc, version)
-        ts_alloc.check_guard()
-
-    def _read_influences_v29(self, ts_alloc: TSAlloc, version: int):
-        # Same layout as TSSkinMesh::assemble_v29. Every count is present;
-        # the arrays themselves are only stored when parentMesh < 0.
+        # Same layout as TSSkinMesh::assemble_v29, which reads every version before 30.
+        # Every count is present; the arrays themselves are only stored when parentMesh < 0.
         initial_verts = ts_alloc.read32()
         if self._parent_mesh < 0:
             ts_alloc.skip32(initial_verts * 3)
@@ -282,29 +303,4 @@ class TSSkinnedMesh(TSMesh):
         if self._parent_mesh < 0:
             self._node_index = ts_alloc.read_u32_list(node_count)
 
-    def _read_influences_legacy(self, ts_alloc: TSAlloc, version: int):
-        # Torque3D layout used before BeamNG's version 29 writer.
-        if version >= 27:
-            ts_alloc.read32()  # maxBones
-        if version < 27:
-            initial_verts = ts_alloc.read32()
-            if self._parent_mesh < 0:
-                ts_alloc.skip32(initial_verts * 3)
-                if version > 21:
-                    ts_alloc.skip32(initial_verts * 3)
-                    ts_alloc.skip8(initial_verts)
-                else:
-                    ts_alloc.skip32(initial_verts * 3)
-
-        transform_count = ts_alloc.read32()
-        if transform_count:
-            raw = ts_alloc.read_float_list(transform_count * 16)
-            self._initial_transforms = [raw[i * 16:(i + 1) * 16] for i in range(transform_count)]
-
-        influence_count = ts_alloc.read32()
-        self._vertex_index = ts_alloc.read_u32_list(influence_count)
-        self._bone_index = ts_alloc.read_u32_list(influence_count)
-        self._weight = ts_alloc.read_float_list(influence_count)
-
-        node_count = ts_alloc.read32()
-        self._node_index = ts_alloc.read_u32_list(node_count)
+        ts_alloc.check_guard()

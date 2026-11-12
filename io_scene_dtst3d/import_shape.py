@@ -30,6 +30,10 @@ def _triangle_strip(strip):
     return triangles
 
 
+def _triangle_fan(fan):
+    return [index for corner in range(1, len(fan) - 1) for index in (fan[0], fan[corner], fan[corner + 1])]
+
+
 def _material(name):
     material = bpy.data.materials.get(name)
     if material is None:
@@ -42,13 +46,9 @@ def _material(name):
 
 
 def _quat_to_blender(quat16: TQuaternion16) -> mathutils.Quaternion:
-    scale = 1.0 / TQuaternion16.MAX_VALUE
-    return mathutils.Quaternion((
-        quat16.w * scale,
-        -quat16.x * scale,
-        -quat16.y * scale,
-        -quat16.z * scale,
-    ))
+    quat = mathutils.Quaternion((quat16.w, -quat16.x, -quat16.y, -quat16.z))
+    quat.normalize()
+    return quat
 
 
 def _node_matrix(node) -> mathutils.Matrix:
@@ -123,8 +123,8 @@ def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
     per_frame, frame_count = _frame_slice(mesh)
     positions = mesh.vertices[:per_frame]
     skinned = isinstance(mesh, TSSkinnedMesh)
-    # Influences address the original vertices, so a skinned mesh is not welded.
-    use_merge = bool(merge_verts) and not skinned and len(mesh.normals) >= per_frame
+    # Influences and vertex frames address the original vertices, so those meshes are not welded.
+    use_merge = bool(merge_verts) and not skinned and frame_count == 1 and len(mesh.normals) >= per_frame
 
     blend = bpy.data.meshes.new(f"DTSMesh{shape_object.start_mesh_index + mesh_index}")
     bmesh_data = bmesh.new()
@@ -133,10 +133,6 @@ def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
     color_layer = bmesh_data.loops.layers.color.new() if len(mesh.colors) >= per_frame else None
 
     obj = _link(bpy.data.objects.new(name, blend))
-    if skinned:
-        obj.rotation_mode = "QUATERNION"
-    else:
-        _apply_node_transform(shape.nodes[shape_object.node_index], obj)
 
     merged_normals = []
     if use_merge:
@@ -201,6 +197,8 @@ def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
             triples = raw
         elif primitive.type == TSDrawPrimitiveType.Strip:
             triples = _triangle_strip(raw)
+        elif primitive.type == TSDrawPrimitiveType.Fan:
+            triples = _triangle_fan(raw)
         else:
             continue
         for offset in range(0, len(triples) - 2, 3):
@@ -223,7 +221,7 @@ def _build_mesh_object(shape, shape_object, mesh_index, name, merge_verts):
     _write_face_attribute(blend, "ts_prim_index", prim_of_face)
     _write_face_attribute(blend, "ts_mat_index", mat_of_face)
 
-    if frame_count > 1 and not use_merge:
+    if frame_count > 1:
         obj.shape_key_add(name="Basis", from_mix=False)
         for frame in range(1, frame_count):
             key = obj.shape_key_add(name=f"frame_{frame}", from_mix=False)
@@ -244,37 +242,98 @@ def _write_face_attribute(blend, name, values):
         pass
 
 
+BONE_LENGTH = 0.05
+
+
 def _armature(shape: TSShape):
     arm = bpy.data.armatures.new("TS_Armature")
     obj = _link(bpy.data.objects.new("TS_Armature", arm))
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.mode_set(mode="EDIT")
     worlds = _world_matrices(shape)
-    bones = {}
+    bones = []
     for index, node in enumerate(shape.nodes):
         bone = arm.edit_bones.new(_name(shape, node.name_index, f"bone_{index}"))
-        bone.head = worlds[index].translation
-        direction = worlds[index].to_3x3() @ mathutils.Vector((0.0, 0.05, 0.0))
-        if direction.length < 1e-6:
-            direction = mathutils.Vector((0.0, 0.05, 0.0))
-        bone.tail = bone.head + direction
-        bones[index] = bone
+        bone.head = (0.0, 0.0, 0.0)
+        bone.tail = (0.0, BONE_LENGTH, 0.0)
+        # The bone frame is the node frame, so pose channels are node-local deltas.
+        bone.matrix = worlds[index]
+        bones.append(bone)
     for index, node in enumerate(shape.nodes):
-        if node.parent_index >= 0:
-            bones[index].parent = bones.get(node.parent_index)
+        if 0 <= node.parent_index < len(bones):
+            bones[index].parent = bones[node.parent_index]
+    bone_names = [bone.name for bone in bones]
     bpy.ops.object.mode_set(mode="OBJECT")
-    return obj
+    return obj, bone_names, worlds
 
 
-def _bind_skin(obj, shape, mesh, arm):
+def _attach_to_bone(obj, arm, bone_name, world):
+    """Parent obj to a bone so it follows the node, keeping `world` as its rest transform."""
+    bone = arm.data.bones[bone_name]
+    # Bone parenting is relative to the bone tail.
+    rest = bone.matrix_local.copy()
+    rest.translation = bone.tail_local
+    obj.parent = arm
+    obj.parent_type = "BONE"
+    obj.parent_bone = bone_name
+    obj.matrix_parent_inverse = (arm.matrix_world @ rest).inverted()
+    obj.matrix_basis = world
+
+
+def _node_holder(shape, index, holders):
+    """The Empty standing for a node, created with its ancestors on first use."""
+    holder = holders.get(index)
+    if holder is None:
+        node = shape.nodes[index]
+        holder = _empty(_name(shape, node.name_index, f"node_{index}"), node)
+        if 0 <= node.parent_index < len(shape.nodes):
+            holder.parent = _node_holder(shape, node.parent_index, holders)
+        holders[index] = holder
+    return holder
+
+
+def _place_in_hierarchy(shape, obj, index, holders):
+    node = shape.nodes[index]
+    _apply_node_transform(node, obj)
+    if 0 <= node.parent_index < len(shape.nodes):
+        obj.parent = _node_holder(shape, node.parent_index, holders)
+    holders.setdefault(index, obj)
+
+
+def _depth(shape, index):
+    depth = 0
+    while 0 <= index < len(shape.nodes) and depth <= len(shape.nodes):
+        index = shape.nodes[index].parent_index
+        depth += 1
+    return depth
+
+
+def _bind_matrix(mesh: TSSkinnedMesh, worlds):
+    """Node world * initial transform: the engine's bone matrix at the default pose.
+
+    It is the identity when the skin was bound to the default pose. Otherwise it is
+    a constant that moves the vertices before the bones deform them.
+    """
+    node_index = mesh.node_index[0]
+    if not mesh.initial_transforms or not 0 <= node_index < len(worlds):
+        return mathutils.Matrix.Identity(4)
+    raw = mesh.initial_transforms[0]
+    initial = mathutils.Matrix([raw[0:4], raw[4:8], raw[8:12], raw[12:16]])
+    return worlds[node_index] @ initial
+
+
+def _bind_skin(obj, shape, mesh, arm, bone_names, worlds):
     if not isinstance(mesh, TSSkinnedMesh) or not mesh.node_index:
         return
+    bind = _bind_matrix(mesh, worlds)
+    if any(abs(bind[row][col] - (row == col)) > 1e-3 for row in range(4) for col in range(4)):
+        obj.matrix_basis = bind
     modifier = obj.modifiers.new("Armature", "ARMATURE")
     modifier.object = arm
     names = {}
     for slot, node_index in enumerate(mesh.node_index):
         if 0 <= node_index < len(shape.nodes):
-            names[slot] = _name(shape, shape.nodes[node_index].name_index, f"bone_{node_index}")
+            names[slot] = bone_names[node_index]
     for bone_name in set(names.values()):
         if bone_name not in obj.vertex_groups:
             obj.vertex_groups.new(name=bone_name)
@@ -285,61 +344,80 @@ def _bind_skin(obj, shape, mesh, arm):
             group.add([int(vertex)], float(weight), "ADD")
 
 
-def _key_sequences(shape: TSShape, arm, fps=30.0):
-    for sequence in shape.sequences:
-        seq_name = _name(shape, sequence.name_index, "Seq")
-        action = bpy.data.actions.new(name=f"TS_{seq_name}")
-        arm.animation_data_create()
-        arm.animation_data.action = action
-        keys = max(1, sequence.num_keyframes)
-        duration = max(0.0, sequence.duration)
+def _key_sequence(shape: TSShape, arm, bone_names, sequence, fps):
+    action = bpy.data.actions.new(name=f"TS_{_name(shape, sequence.name_index, 'Seq')}")
+    arm.animation_data.action = action
+    keys = max(1, sequence.num_keyframes)
+    if keys > 1 and sequence.duration > 0.0:
+        frames_per_key = sequence.duration * fps / (keys - 1)
+    else:
+        frames_per_key = fps / 30.0
 
-        def frame_of(key):
-            if keys <= 1:
-                return 1
-            return int(round(key * (duration / (keys - 1)) * fps) + 1)
-
-        for node_index, node in enumerate(shape.nodes):
-            pose = arm.pose.bones.get(_name(shape, node.name_index, f"bone_{node_index}"))
-            if pose is None:
-                continue
-            rest_quat = _quat_to_blender(node.rotation)
-            rest_pos = node.translation
-            rotates = sequence.rotation_matters.test(node_index)
-            moves = sequence.translation_matters.test(node_index)
-            scales = sequence.scale_matters.test(node_index)
-            rot_slot = sequence.rotation_matters.rank(node_index) if rotates else None
-            pos_slot = sequence.translation_matters.rank(node_index) if moves else None
-            scale_slot = sequence.scale_matters.rank(node_index) if scales else None
-            for key in range(keys):
-                frame = frame_of(key)
+    for node_index, node in enumerate(shape.nodes):
+        rotates = sequence.rotation_matters.test(node_index)
+        moves = sequence.translation_matters.test(node_index)
+        scales = sequence.scale_matters.test(node_index)
+        if not (rotates or moves or scales):
+            continue
+        pose = arm.pose.bones[bone_names[node_index]]
+        pose.rotation_mode = "QUATERNION"
+        rest_quat = _quat_to_blender(node.rotation)
+        rest_inverse = rest_quat.inverted()
+        rest_pos = mathutils.Vector(node.translation)
+        rot_slot = sequence.rotation_matters.rank(node_index) if rotates else None
+        pos_slot = sequence.translation_matters.rank(node_index) if moves else None
+        scale_slot = sequence.scale_matters.rank(node_index) if scales else None
+        previous = None
+        for key in range(keys):
+            frame = 1.0 + key * frames_per_key
+            if rotates:
                 anim_quat = rest_quat
-                if rot_slot is not None:
-                    sample = sequence.base_rotation + rot_slot * keys + key
-                    if 0 <= sample < len(shape.anim_node_rotations):
-                        anim_quat = _quat_to_blender(shape.anim_node_rotations[sample])
-                anim_pos = rest_pos
-                if pos_slot is not None:
-                    sample = sequence.base_translation + pos_slot * keys + key
-                    if 0 <= sample < len(shape.anim_node_translations):
-                        anim_pos = shape.anim_node_translations[sample]
-                scale = _sample_scale(shape, sequence, scale_slot, keys, key)
-                pose.rotation_mode = "QUATERNION"
-                pose.rotation_quaternion = rest_quat.inverted() @ anim_quat
-                pose.location = (
-                    anim_pos[0] - rest_pos[0],
-                    anim_pos[1] - rest_pos[1],
-                    anim_pos[2] - rest_pos[2],
-                )
-                pose.scale = scale
+                sample = sequence.base_rotation + rot_slot * keys + key
+                if 0 <= sample < len(shape.anim_node_rotations):
+                    anim_quat = _quat_to_blender(shape.anim_node_rotations[sample])
+                basis = rest_inverse @ anim_quat
+                # Keep neighbouring keys in one hemisphere so interpolation takes the short way.
+                if previous is not None and basis.dot(previous) < 0.0:
+                    basis.negate()
+                previous = basis
+                pose.rotation_quaternion = basis
                 pose.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+            if moves:
+                anim_pos = rest_pos
+                sample = sequence.base_translation + pos_slot * keys + key
+                if 0 <= sample < len(shape.anim_node_translations):
+                    anim_pos = mathutils.Vector(shape.anim_node_translations[sample])
+                pose.location = rest_inverse @ (anim_pos - rest_pos)
                 pose.keyframe_insert(data_path="location", frame=frame)
+            if scales:
+                pose.scale = _sample_scale(shape, sequence, scale_slot, keys, key)
                 pose.keyframe_insert(data_path="scale", frame=frame)
 
-        track = arm.animation_data.nla_tracks.new()
-        track.name = action.name
-        strip = track.strips.new(action.name, 1, action)
-        strip.frame_end = max(2, round(duration * fps) + 1)
+
+def _key_sequences(shape: TSShape, arm, bone_names):
+    scene = bpy.context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    edit = bpy.context.preferences.edit
+    interpolation = edit.keyframe_new_interpolation_type
+    # The engine blends linearly between keys.
+    edit.keyframe_new_interpolation_type = "LINEAR"
+    arm.animation_data_create()
+    try:
+        for index, sequence in enumerate(shape.sequences):
+            _key_sequence(shape, arm, bone_names, sequence, fps)
+            for pose in arm.pose.bones:
+                pose.location = (0.0, 0.0, 0.0)
+                pose.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+                pose.scale = (1.0, 1.0, 1.0)
+            action = arm.animation_data.action
+            arm.animation_data.action = None
+            # Tracks overlap in time, so only the first sequence plays until another track is unmuted.
+            track = arm.animation_data.nla_tracks.new()
+            track.name = action.name
+            track.strips.new(action.name, 1, action)
+            track.mute = index > 0
+    finally:
+        edit.keyframe_new_interpolation_type = interpolation
 
 
 def _sample_scale(shape, sequence, slot, keys, key):
@@ -395,24 +473,23 @@ def _lod_name(base, mesh, detail):
 
 def build_scene(shape: TSShape, merge_verts: bool = True):
     skinned = any(isinstance(mesh, TSSkinnedMesh) for mesh in shape.meshes)
-    arm = _armature(shape) if (skinned or shape.sequences) and shape.nodes else None
-    hierarchy = {}
+    arm = bone_names = worlds = None
+    if (skinned or shape.sequences) and shape.nodes:
+        arm, bone_names, worlds = _armature(shape)
+    holders = {}
     created = []
 
-    for obj_index, shape_object in enumerate(shape.objects):
+    # Parents first, so a node's object is the holder its children attach to.
+    order = sorted(range(len(shape.objects)), key=lambda index: _depth(shape, shape.objects[index].node_index))
+    for obj_index in order:
+        shape_object = shape.objects[obj_index]
         base = _name(shape, shape_object.name_index, f"object_{obj_index}")
-        node = shape.nodes[shape_object.node_index]
-        parent = hierarchy.get(node.parent_index) if node.parent_index >= 0 else None
-
-        def hold(empty):
-            if parent is not None and empty is not None:
-                empty.parent = parent
-                bpy.context.view_layer.update()
-                empty.matrix_parent_inverse = parent.matrix_world.inverted()
-            hierarchy[shape_object.node_index] = empty
+        node_index = shape_object.node_index
+        has_node = 0 <= node_index < len(shape.nodes)
 
         if _is_utility_empty(base.lower()) or shape_object.num_meshes <= 0:
-            hold(_empty(base, node))
+            if has_node and arm is None:
+                _node_holder(shape, node_index, holders)
             continue
 
         subshape = shape.get_sub_shape_for_object(obj_index)
@@ -422,7 +499,6 @@ def build_scene(shape: TSShape, merge_verts: bool = True):
                 if detail.sub_shape_num == subshape and detail.object_detail_num >= 0:
                     details[detail.object_detail_num] = detail
 
-        made_one = False
         for mesh_index in range(shape_object.num_meshes):
             global_index = shape_object.start_mesh_index + mesh_index
             if global_index >= len(shape.meshes):
@@ -435,22 +511,18 @@ def build_scene(shape: TSShape, merge_verts: bool = True):
                 _lod_name(base, mesh, details.get(mesh_index)),
                 merge_verts,
             )
-            made_one = True
-            if parent is not None and not isinstance(mesh, TSSkinnedMesh):
-                obj.parent = parent
-                bpy.context.view_layer.update()
-                obj.matrix_parent_inverse = parent.matrix_world.inverted()
+            if has_node and not isinstance(mesh, TSSkinnedMesh):
+                if arm is not None:
+                    _attach_to_bone(obj, arm, bone_names[node_index], worlds[node_index])
+                else:
+                    _place_in_hierarchy(shape, obj, node_index, holders)
             # ID properties are signed 32-bit. Bit 31 is the billboard flag.
             obj["ts_flags"] = int(mesh.flags) - (0x100000000 if mesh.flags >= 0x80000000 else 0)
-            if not isinstance(mesh, TSSkinnedMesh):
-                hierarchy[shape_object.node_index] = obj
             created.append((obj, mesh))
-        if not made_one:
-            hold(_empty(base, node))
 
     if arm is not None:
         for obj, mesh in created:
-            _bind_skin(obj, shape, mesh, arm)
+            _bind_skin(obj, shape, mesh, arm, bone_names, worlds)
         if shape.sequences:
-            _key_sequences(shape, arm)
+            _key_sequences(shape, arm, bone_names)
     _detail_empties(shape)

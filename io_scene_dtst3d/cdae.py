@@ -6,8 +6,10 @@ Vectors are packed as (count, element size, raw bytes). Integer sets are
 arrays when it has a parent mesh.
 """
 
+import os
 import struct
 import sys
+import zipfile
 from array import array
 
 from .integerset import TSIntegerSet
@@ -24,6 +26,64 @@ from .tsshape import (
 )
 
 _DETAIL = struct.Struct("<iiifffiiiIIfI")
+
+
+def _load_bundled_wheels():
+    # scripts/addons copies are not installed extensions, so Blender never
+    # puts the manifest wheels on sys.path.
+    try:
+        import msgpack  # noqa: F401
+        import zstandard  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import platform
+
+    addon = os.path.dirname(__file__)
+    wheels = os.path.join(addon, "wheels")
+    site = os.path.join(wheels, "site-packages")
+    if site not in sys.path:
+        sys.path.insert(0, site)
+    try:
+        import msgpack  # noqa: F401
+        import zstandard  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    machine = platform.machine().lower()
+    if sys.platform.startswith("win"):
+        plat = "win_arm64" if machine in ("arm64", "aarch64") else "win_amd64"
+    elif sys.platform == "darwin":
+        plat = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+    else:
+        plat = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+
+    if not os.path.isdir(wheels):
+        raise ImportError("CDAE needs msgpack and zstandard. Run tools/fetch_wheels.py, then reload the add-on.")
+
+    os.makedirs(site, exist_ok=True)
+    found = []
+    for name in sorted(os.listdir(wheels)):
+        if not name.endswith(".whl") or py not in name or plat not in name:
+            continue
+        if not (name.startswith("msgpack-") or name.startswith("zstandard-")):
+            continue
+        found.append(name)
+        with zipfile.ZipFile(os.path.join(wheels, name)) as archive:
+            archive.extractall(site)
+    if len({name.split("-", 1)[0] for name in found}) < 2:
+        raise ImportError(f"No {py} {plat} msgpack and zstandard wheels in {wheels}. Run tools/fetch_wheels.py.")
+
+    import importlib
+    importlib.invalidate_caches()
+    import msgpack  # noqa: F401
+    import zstandard  # noqa: F401
+
+
+_load_bundled_wheels()
 
 
 def _as_int(value) -> int:
